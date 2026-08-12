@@ -116,6 +116,37 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("_seq_lock = threading.Lock()", src)
         self.assertIn("with _seq_lock:", src)
 
+    def test_unrestricted_module_exposes_generic_and_safe_named_wrappers(self):
+        """Unrestricted PTC can dispatch every enabled non-recursive tool."""
+        calls = []
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True):
+            src = generate_hermes_tools_module(["delegate_task", "terminal", "execute_code"])
+
+        namespace = {}
+        exec(src, namespace)
+        namespace["_call"] = lambda name, args: calls.append((name, args)) or {"ok": True}
+
+        self.assertEqual(namespace["call_tool"]("delegate_task", goal="inspect"), {"ok": True})
+        self.assertEqual(namespace["delegate_task"](goal="review"), {"ok": True})
+        self.assertEqual(
+            calls,
+            [
+                ("delegate_task", {"goal": "inspect"}),
+                ("delegate_task", {"goal": "review"}),
+            ],
+        )
+        self.assertNotIn("execute_code", namespace)
+
+    def test_default_module_keeps_the_narrow_static_surface(self):
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=False):
+            src = generate_hermes_tools_module(["delegate_task", "terminal"])
+
+        namespace = {}
+        exec(src, namespace)
+        self.assertNotIn("call_tool", namespace)
+        self.assertNotIn("delegate_task", namespace)
+        self.assertIn("terminal", namespace)
+
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
@@ -249,6 +280,45 @@ print(result.get("output", ""))
         self.assertEqual(result["status"], "success")
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
+
+    def test_unrestricted_executes_enabled_tools_outside_static_allowlist(self):
+        """The session's actual tool set, not the legacy seven, is authoritative."""
+        code = """
+from hermes_tools import delegate_task
+result = delegate_task(goal="inspect")
+print(result.get("accepted", False))
+"""
+
+        def dispatcher(function_name, function_args, task_id=None, user_task=None):
+            self.assertEqual(function_name, "delegate_task")
+            self.assertEqual(function_args, {"goal": "inspect"})
+            return json.dumps({"accepted": True})
+
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True), \
+             patch("model_tools.handle_function_call", side_effect=dispatcher):
+            result = json.loads(execute_code(
+                code=code,
+                task_id="test-unrestricted-tool",
+                enabled_tools=["delegate_task", "execute_code"],
+            ))
+
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(result["tool_calls_made"], 1)
+        self.assertIn("True", result["output"])
+
+    def test_unrestricted_zero_timeout_has_no_script_deadline(self):
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True), \
+             patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 0, "max_tool_calls": 0}), \
+             patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
+            result = json.loads(execute_code(
+                "import time; time.sleep(0.05); print('finished')",
+                task_id="test-unrestricted-no-deadline",
+                enabled_tools=["terminal"],
+            ))
+
+        self.assertEqual(result["status"], "success", result)
+        self.assertIn("finished", result["output"])
 
 
     def test_concurrent_tool_calls_match_responses(self):
@@ -558,6 +628,25 @@ class TestEnvVarFiltering(unittest.TestCase):
             os.environ.clear()
             os.environ.update(env_backup)
 
+    def test_unrestricted_child_inherits_full_scoped_environment(self):
+        from tools.code_execution_tool import _scrub_child_env
+        from agent.delegation_context import delegated_child_context
+
+        source = {
+            "PATH": "/bin",
+            "HERMES_HOME": "/tmp/profile-a",
+            "HERMES_SESSION_PROFILE": "profile-a",
+            "PROFILE_A_API_KEY": "profile-a-secret",
+            "HERMES_KANBAN_DB": "/tmp/profile-a/kanban.db",
+            "EXAMPLE_API_KEY": "test-only-value",
+            "CUSTOM_SETTING": "enabled",
+        }
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True):
+            with delegated_child_context():
+                child = _scrub_child_env(source, is_passthrough=lambda _name: False)
+
+        self.assertEqual(child, source)
+
 
 # ---------------------------------------------------------------------------
 # execute_code edge cases
@@ -772,7 +861,7 @@ class TestRpcTokenAuthorization(unittest.TestCase):
     round-trips normally.
     """
 
-    def _drive_server(self, rpc_token, requests):
+    def _drive_server(self, rpc_token, requests, *, max_tool_calls=10, handler=None):
         """Run _rpc_server_loop against a real AF_UNIX socketpair.
 
         Sends each dict in *requests* as a newline-delimited JSON message
@@ -808,14 +897,14 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         def _run():
             with patch(
                 "model_tools.handle_function_call",
-                side_effect=_mock_handle_function_call,
+                side_effect=handler or _mock_handle_function_call,
             ):
                 _rpc_server_loop(
                     listener,
                     "test-task",
                     tool_call_log,
                     tool_call_counter,
-                    max_tool_calls=10,
+                    max_tool_calls=max_tool_calls,
                     allowed_tools=frozenset({"terminal"}),
                     stop_event=stop_event,
                     rpc_token=rpc_token,
@@ -861,6 +950,49 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         src = generate_hermes_tools_module(["terminal"], transport="uds")
         self.assertIn("HERMES_RPC_TOKEN", src)
         self.assertIn('"token"', src)
+
+    def test_unrestricted_zero_tool_limit_is_unlimited(self):
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True):
+            resp = self._drive_server(
+                "secret-token",
+                [{
+                    "tool": "terminal",
+                    "args": {"command": "echo hi"},
+                    "token": "secret-token",
+                }],
+                max_tool_calls=0,
+            )
+
+        self.assertEqual(len(resp), 1)
+        self.assertNotIn("Tool call limit reached", resp[0].get("error", ""))
+
+    def test_unrestricted_preserves_terminal_background_parameters(self):
+        seen_args = []
+
+        def capture(function_name, function_args, task_id=None, user_task=None):
+            seen_args.append(dict(function_args))
+            return json.dumps({"ok": True})
+
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True):
+            resp = self._drive_server(
+                "secret-token",
+                [{
+                    "tool": "terminal",
+                    "args": {
+                        "command": "echo hi",
+                        "background": True,
+                        "pty": True,
+                        "notify_on_complete": True,
+                    },
+                    "token": "secret-token",
+                }],
+                handler=capture,
+            )
+
+        self.assertEqual(resp, [{"ok": True}])
+        self.assertEqual(seen_args[0]["background"], True)
+        self.assertEqual(seen_args[0]["pty"], True)
+        self.assertEqual(seen_args[0]["notify_on_complete"], True)
 
 
 if __name__ == "__main__":

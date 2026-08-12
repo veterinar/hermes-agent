@@ -30,6 +30,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 
 import base64
 import json
+import keyword
 import logging
 import os
 import platform
@@ -75,6 +76,50 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+
+
+def _unrestricted_enabled() -> bool:
+    """Read the process-frozen operator policy without creating an import cycle."""
+    try:
+        from hermes_cli.runtime_policy import is_unrestricted
+
+        return is_unrestricted()
+    except Exception:
+        return False
+
+
+def _resolve_sandbox_tools(enabled_tools: Optional[List[str]]) -> frozenset:
+    """Resolve the RPC surface for this execute_code invocation.
+
+    The normal policy retains the legacy seven-tool allowlist and fallback.
+    Unrestricted mode trusts the session's already-resolved tool inventory,
+    while excluding execute_code itself so generated code cannot recurse.
+    """
+    session_tools = set(enabled_tools or ())
+    if _unrestricted_enabled():
+        session_tools.discard("execute_code")
+        return frozenset(session_tools)
+
+    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
+    return sandbox_tools or SANDBOX_ALLOWED_TOOLS
+
+
+def _tool_call_limit_reached(count: int, max_tool_calls: int) -> bool:
+    """Treat zero as unlimited only under the explicit unrestricted policy."""
+    if _unrestricted_enabled() and max_tool_calls == 0:
+        return False
+    return count >= max_tool_calls
+
+
+def _prepare_rpc_tool_args(tool_name: str, tool_args: Any) -> Any:
+    """Apply the normal terminal sub-call restrictions without mutating input."""
+    if tool_name != "terminal" or not isinstance(tool_args, dict):
+        return tool_args
+    prepared = dict(tool_args)
+    if not _unrestricted_enabled():
+        for param in _TERMINAL_BLOCKED_PARAMS:
+            prepared.pop(param, None)
+    return prepared
 
 
 def _assemble_stdout_result(
@@ -241,6 +286,12 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     if is_windows is None:
         is_windows = _IS_WINDOWS
 
+    if _unrestricted_enabled():
+        # Unrestricted is literal: the sandbox child receives the caller's
+        # environment unchanged. Do not re-scope profile/session variables or
+        # strip dispatcher variables in this mode.
+        return dict(source_env)
+
     scrubbed = {}
     # Non-secret HERMES_* vars dropped by the tightened allowlist (#27303). The
     # broad "HERMES_" prefix used to pass these through; now only the
@@ -268,8 +319,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             scrubbed[k] = v
             continue
         if k.startswith("HERMES_"):
-            # Non-secret (secrets were already dropped above) and not in any
-            # allowlist — a deliberately-dropped HERMES_* var.
+            # Non-secret (secrets were already dropped above) and not in
+            # any allowlist — a deliberately-dropped HERMES_* var.
             _dropped_hermes.append(k)
     if _dropped_hermes:
         logger.debug(
@@ -392,12 +443,23 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
         )
         if m:
             missing = m.group(1)
-            available = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or SANDBOX_ALLOWED_TOOLS))
+            if _unrestricted_enabled():
+                available = sorted(set(enabled_tools or ()) - {"execute_code"})
+            else:
+                available = sorted(
+                    SANDBOX_ALLOWED_TOOLS
+                    & set(enabled_tools or SANDBOX_ALLOWED_TOOLS)
+                )
             builtin = {"json_parse", "shell_quote", "retry"}
             if missing in builtin:
                 return (
                     f"{missing} is a BUILT-IN helper in the sandbox — no import "
                     f"needed. Remove it from the import line and call {missing}(...) directly."
+                )
+            if _unrestricted_enabled():
+                return (
+                    f"'{missing}' is not enabled for this execute_code call. "
+                    f"Importable session tools here: {', '.join(available)}."
                 )
             return (
                 f"'{missing}' is not available inside the execute_code sandbox. "
@@ -440,7 +502,11 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         transport: ``"uds"`` for Unix domain socket (local backend) or
                    ``"file"`` for file-based RPC (remote backends).
     """
-    tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    unrestricted = _unrestricted_enabled()
+    if unrestricted:
+        tools_to_generate = sorted(set(enabled_tools) - {"execute_code"})
+    else:
+        tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
 
     stub_functions = []
     export_names = []
@@ -454,6 +520,29 @@ def generate_hermes_tools_module(enabled_tools: List[str],
             f"    return _call({func_name!r}, {args_expr})\n"
         )
         export_names.append(func_name)
+
+    if unrestricted:
+        # The parent RPC allowlist remains authoritative.  call_tool makes
+        # every session-enabled tool reachable without needing to mirror its
+        # schema here, and identifier-safe names also receive ergonomic
+        # keyword-only wrappers.
+        stub_functions.insert(
+            0,
+            "def call_tool(name: str, **kwargs):\n"
+            "    \"\"\"Call any enabled Hermes tool by its registry name.\"\"\"\n"
+            "    return _call(name, kwargs)\n",
+        )
+        for tool_name in tools_to_generate:
+            if tool_name in _TOOL_STUBS or tool_name == "call_tool":
+                continue
+            if not tool_name.isidentifier() or keyword.iskeyword(tool_name):
+                continue
+            stub_functions.append(
+                f"def {tool_name}(**kwargs):\n"
+                f"    \"\"\"Call the enabled {tool_name} Hermes tool.\"\"\"\n"
+                f"    return call_tool({tool_name!r}, **kwargs)\n"
+            )
+            export_names.append(tool_name)
 
     if transport == "file":
         header = _FILE_TRANSPORT_HEADER
@@ -727,7 +816,7 @@ def _rpc_server_loop(
                     continue
 
                 # Enforce tool call limit
-                if tool_call_counter[0] >= max_tool_calls:
+                if _tool_call_limit_reached(tool_call_counter[0], max_tool_calls):
                     resp = tool_error(
                         f"Tool call limit reached ({max_tool_calls}). "
                         "No more tool calls allowed in this execution."
@@ -735,10 +824,7 @@ def _rpc_server_loop(
                     conn.sendall((resp + "\n").encode())
                     continue
 
-                # Strip forbidden terminal parameters
-                if tool_name == "terminal" and isinstance(tool_args, dict):
-                    for param in _TERMINAL_BLOCKED_PARAMS:
-                        tool_args.pop(param, None)
+                tool_args = _prepare_rpc_tool_args(tool_name, tool_args)
 
                 # Dispatch through the standard tool handler.
                 # Suppress stdout/stderr from internal tool handlers so
@@ -1006,16 +1092,13 @@ def _rpc_poll_loop(
                         f"Available: {available}"
                     )
                 # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
+                elif _tool_call_limit_reached(tool_call_counter[0], max_tool_calls):
                     tool_result = tool_error(
                         f"Tool call limit reached ({max_tool_calls}). "
                         "No more tool calls allowed in this execution."
                     )
                 else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
+                    tool_args = _prepare_rpc_tool_args(tool_name, tool_args)
 
                     # Dispatch through the standard tool handler
                     try:
@@ -1076,10 +1159,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1334,11 +1414,7 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -1514,7 +1590,11 @@ def execute_code(
         )
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
-        deadline = time.monotonic() + timeout
+        deadline = (
+            None
+            if _unrestricted_enabled() and timeout == 0
+            else time.monotonic() + timeout
+        )
         stderr_chunks: list = []
 
         # Background readers to avoid pipe buffer deadlocks.
@@ -1604,7 +1684,7 @@ def execute_code(
                 status = "interrupted"
                 break
             now = time.monotonic()
-            if now > deadline:
+            if deadline is not None and now > deadline:
                 _kill_process_group(proc, escalate=True)
                 status = "timeout"
                 break
@@ -1616,7 +1696,10 @@ def execute_code(
                 except Exception:
                     pass
             try:
-                proc.wait(timeout=min(poll_interval, max(0.0, deadline - now)))
+                wait_timeout = poll_interval
+                if deadline is not None:
+                    wait_timeout = min(poll_interval, max(0.0, deadline - now))
+                proc.wait(timeout=wait_timeout)
             except subprocess.TimeoutExpired:
                 pass
             poll_interval = min(0.2, poll_interval * 1.5)

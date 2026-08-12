@@ -2203,6 +2203,10 @@ DEFAULT_CONFIG = {
 
     # Pre-exec security scanning via tirith
     "security": {
+        # Operator-selected master override for Hermes policy restrictions.
+        # This is process-frozen at startup; protocol authentication, locks,
+        # process reaping, and other correctness invariants still apply.
+        "unrestricted": False,
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
         # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/

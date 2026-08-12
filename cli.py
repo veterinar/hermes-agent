@@ -761,6 +761,8 @@ def load_cli_config() -> Dict[str, Any]:
     # Security settings
     security_config = defaults.get("security", {})
     if isinstance(security_config, dict):
+        from hermes_cli.runtime_policy import bridge_unrestricted_to_env
+        bridge_unrestricted_to_env(defaults)
         redact = security_config.get("redact_secrets")
         if redact is not None:
             os.environ["HERMES_REDACT_SECRETS"] = str(redact).lower()

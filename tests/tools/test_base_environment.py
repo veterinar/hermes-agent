@@ -4,7 +4,7 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
 
@@ -38,6 +38,45 @@ class TestBoundedOutputCollector:
         assert rendered.startswith("HEAD-SENTINEL")
         assert rendered.endswith("TAIL-SENTINEL")
         assert "[OUTPUT TRUNCATED" in rendered
+
+
+class TestUnrestrictedTimeout:
+    def test_zero_timeout_is_forwarded_and_has_no_deadline(self):
+        env = _TestableEnv(timeout=10)
+        proc = MagicMock()
+        captured = {}
+
+        def fake_run_bash(_command, *, login=False, timeout=120, stdin_data=None):
+            captured["spawn_timeout"] = timeout
+            return proc
+
+        def fake_wait(_proc, timeout=120, *, bounded_capture=False):
+            captured["wait_timeout"] = timeout
+            return {"output": "done", "returncode": 0}
+
+        env._run_bash = fake_run_bash
+        env._wait_for_process = fake_wait
+        env._snapshot_ready = True
+
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True):
+            result = env.execute("echo done", timeout=0)
+
+        assert result["returncode"] == 0
+        assert captured == {"spawn_timeout": 0, "wait_timeout": 0}
+
+    def test_wait_with_zero_timeout_does_not_kill_running_process(self, monkeypatch):
+        env = _TestableEnv(timeout=10)
+        proc = MagicMock()
+        proc.stdout = iter([])
+        proc.poll.side_effect = [None, 0, 0]
+        proc.returncode = 0
+        monkeypatch.setattr("tools.environments.base.time.sleep", lambda _: None)
+
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True):
+            result = env._wait_for_process(proc, timeout=0)
+
+        assert result["returncode"] == 0
+        proc.kill.assert_not_called()
 
 
     def test_required_status_suffix_stays_inside_limit(self):

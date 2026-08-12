@@ -13,6 +13,16 @@ from unittest import mock
 import agent.monitoring.redaction as R
 
 
+def test_unrestricted_policy_bypasses_monitoring_redaction(monkeypatch):
+    text = (
+        "fake secret sk-" + "A" * 24
+        + " for nobody@example.test id 123e4567-e89b-12d3-a456-426614174000"
+    )
+    monkeypatch.setattr(R, "is_unrestricted", lambda: True, raising=False)
+
+    assert R.redact_for_export(text) == text
+
+
 def test_secret_key_always_stripped():
     fake_key = "sk-ant-api03-" + "A" * 24  # constructed to dodge literal-scrubbers
     out = R.redact_for_export(f"calling with key {fake_key} and moving on")

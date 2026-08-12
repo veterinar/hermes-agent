@@ -2223,7 +2223,8 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     # disabled so the next startup will not spawn it. (#45620)
     config = read_raw_config()
     raw_mcp_servers = config.get("mcp_servers")
-    if isinstance(raw_mcp_servers, dict):
+    from hermes_cli.runtime_policy import is_unrestricted as _is_unrestricted
+    if isinstance(raw_mcp_servers, dict) and not _is_unrestricted():
         try:
             from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
         except Exception:

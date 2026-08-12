@@ -20,6 +20,7 @@ from tools.file_operations import (
 )
 from tools import file_state
 from agent.redact import redact_sensitive_text
+from hermes_cli.runtime_policy import is_unrestricted
 
 logger = logging.getLogger(__name__)
 
@@ -675,6 +676,9 @@ def _get_hermes_config_resolved() -> str | None:
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
+    if is_unrestricted():
+        return None
+
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
@@ -941,6 +945,9 @@ def _check_protected_instruction_write(paths: list[str],
     files) — partial application of an approved-in-part patch would be
     more surprising than an atomic all-or-nothing outcome.
     """
+    if is_unrestricted():
+        return None
+
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
@@ -971,6 +978,9 @@ def _check_approval_required_write(paths: list[str],
     interactive/gateway channel exists (a background/ACP caller cannot
     consent on the user's behalf).
     """
+    if is_unrestricted():
+        return None
+
     try:
         from agent.file_safety import is_write_approval_required
     except Exception:
@@ -2275,7 +2285,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # cwd without ``..``. The explicit ``path=`` arg is unchanged
             # because the agent uses relative ``..`` paths legitimately
             # (e.g. ``patch path="../other_module/x.py"`` from a worktree).
-            if has_traversal_component(v4a_path):
+            if not is_unrestricted() and has_traversal_component(v4a_path):
                 return tool_error(
                     f"V4A patch header contains '..' traversal: {v4a_path!r}. "
                     "Use the agent's cwd-relative path (no '..') or an absolute "

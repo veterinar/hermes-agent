@@ -2307,6 +2307,8 @@ if _config_path.exists():
         # Security settings
         _security_cfg = _cfg.get("security", {})
         if isinstance(_security_cfg, dict):
+            from hermes_cli.runtime_policy import bridge_unrestricted_to_env
+            bridge_unrestricted_to_env(_cfg)
             _redact = _security_cfg.get("redact_secrets")
             if _redact is not None:
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()

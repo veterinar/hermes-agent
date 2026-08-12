@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
+from hermes_cli.runtime_policy import is_unrestricted
 
 logger = logging.getLogger(__name__)
 
@@ -2645,20 +2646,26 @@ def terminal_tool(
             cwd = remapped
         default_timeout = config["timeout"]
 
-        # Validate an explicit timeout before it flows into deadline math.
-        # ``timeout or default`` silently turns 0 into the default (0 can't mean
-        # "no timeout" here), and a negative value is truthy so it would sail
-        # through to ``deadline = now + timeout`` and fire an immediate,
-        # nonsensical "-Ns" timeout. Reject non-positive values outright.
-        if timeout is not None and timeout <= 0:
+        # In the default policy an explicit zero is invalid. Under the
+        # operator-selected unrestricted policy it is the unlimited sentinel
+        # implemented by the environment layer. Negative values remain an
+        # invalid protocol value in either mode.
+        if timeout is not None and (
+            timeout < 0 or (timeout == 0 and not is_unrestricted())
+        ):
             return tool_error(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
-        effective_timeout = timeout or default_timeout
+        effective_timeout = default_timeout if timeout is None else timeout
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+        if (
+            not is_unrestricted()
+            and not background
+            and timeout
+            and timeout > FOREGROUND_MAX_TIMEOUT
+        ):
             return tool_error(
                 f"Foreground timeout {timeout}s exceeds the maximum of "
                 f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
@@ -2667,7 +2674,7 @@ def terminal_tool(
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
-        if not background:
+        if not is_unrestricted() and not background:
             guidance = _foreground_background_guidance(command)
             if guidance:
                 return json.dumps({
@@ -2782,7 +2789,7 @@ def terminal_tool(
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
+        if not is_unrestricted() and os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
@@ -2896,9 +2903,10 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
-        # Non-bypassable: rewriting the local checkout backing this interpreter
-        # can mix module versions. Remote backends cannot reach that checkout.
-        if env_type == "local":
+        # Default policy blocks rewriting the checkout backing this live
+        # interpreter because mixed module versions are usually accidental.
+        # The explicit unrestricted policy delegates that risk to the operator.
+        if not is_unrestricted() and env_type == "local":
             from tools.self_repo_guard import detect_self_repo_git_mutation
 
             guard_cwd = _resolve_command_cwd(
@@ -3785,6 +3793,26 @@ TERMINAL_SCHEMA = {
 }
 
 
+def build_terminal_schema() -> Dict[str, Any]:
+    """Return the terminal schema for the process-frozen runtime policy."""
+    if not is_unrestricted():
+        return TERMINAL_SCHEMA
+
+    schema = dict(TERMINAL_SCHEMA)
+    parameters = dict(schema["parameters"])
+    properties = dict(parameters["properties"])
+    timeout = dict(properties["timeout"])
+    timeout["minimum"] = 0
+    timeout["description"] = (
+        "Max seconds to wait (default: 180). Set 0 for unlimited; "
+        "foreground commands have no policy cap in unrestricted mode."
+    )
+    properties["timeout"] = timeout
+    parameters["properties"] = properties
+    schema["parameters"] = parameters
+    return schema
+
+
 def _handle_terminal(args, **kw):
     # Mirror of execute_code's misplaced-argument recovery: models sometimes
     # send execute_code's ``code`` argument here. Without this, the call
@@ -3813,7 +3841,7 @@ def _handle_terminal(args, **kw):
 registry.register(
     name="terminal",
     toolset="terminal",
-    schema=TERMINAL_SCHEMA,
+    schema=build_terminal_schema(),
     handler=_handle_terminal,
     check_fn=check_terminal_requirements,
     emoji="💻",

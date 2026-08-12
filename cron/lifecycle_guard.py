@@ -45,6 +45,8 @@ from typing import Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
+from hermes_cli.runtime_policy import is_unrestricted
+
 
 class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
@@ -678,6 +680,9 @@ def check_gateway_lifecycle(
     fail with a ``ValueError``-shaped error (the agent's ``cronjob`` tool
     surfaces this as a tool error; the CLI prints it in red and exits 1).
     """
+    if is_unrestricted():
+        return
+
     combined = prompt or ""
     python_script = False
     if script:

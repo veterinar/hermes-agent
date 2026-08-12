@@ -1,6 +1,7 @@
 """Tests for execute_code sandbox failure hints."""
 
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -38,6 +39,23 @@ class TestSandboxFailureHint:
 
     def test_empty_stderr_no_hint(self):
         assert _sandbox_failure_hint("") is None
+
+    def test_unrestricted_hint_reports_the_session_tool_inventory(self):
+        err = (
+            "ImportError: cannot import name 'missing_tool' "
+            "from 'hermes_tools'"
+        )
+        with patch("hermes_cli.runtime_policy.is_unrestricted", return_value=True):
+            hint = _sandbox_failure_hint(
+                err,
+                enabled_tools={"delegate_task", "browser_navigate", "execute_code"},
+            )
+
+        assert "browser_navigate" in hint
+        assert "delegate_task" in hint
+        inventory = hint.split("here:", 1)[1]
+        assert "execute_code" not in inventory
+        assert "normal tool call" not in hint
 
 
 class TestLiveSandboxHint:

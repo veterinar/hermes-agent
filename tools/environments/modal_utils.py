@@ -113,7 +113,10 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
             )
 
         deadline = None
-        if self._client_timeout_grace_seconds is not None:
+        if (
+            self._client_timeout_grace_seconds is not None
+            and prepared.timeout != 0
+        ):
             deadline = time.monotonic() + prepared.timeout + self._client_timeout_grace_seconds
 
         _now = time.monotonic()
@@ -167,7 +170,7 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
         stdin_data: str | None = None,
     ) -> PreparedModalExec:
         effective_cwd = cwd or self.cwd
-        effective_timeout = timeout or self.timeout
+        effective_timeout = self.timeout if timeout is None else timeout
 
         exec_command = command
         exec_stdin = stdin_data if self._stdin_mode == "payload" else None

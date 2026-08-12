@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli.runtime_policy import is_unrestricted
+
 
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
@@ -134,19 +136,24 @@ def _classify_write_denial(path: str) -> Optional[str]:
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
-    # Approval-gated paths (e.g. ~/.ssh/config) are NOT hard-denied here:
-    # they are allowed at this layer so the interactive file tools can run
-    # their approval prompt, and only blocked for non-interactive callers
-    # via get_write_approval_error(). Checked before the credential deny so
-    # the ``.ssh/`` directory prefix below doesn't swallow the config file.
-    if resolved in build_write_approval_paths(home):
+    unrestricted = is_unrestricted()
+    if unrestricted:
         return None
 
-    if resolved in build_write_denied_paths(home):
-        return "credential"
-    for prefix in build_write_denied_prefixes(home):
-        if resolved.startswith(prefix):
+    if not unrestricted:
+        # Approval-gated paths (e.g. ~/.ssh/config) are NOT hard-denied here:
+        # they are allowed at this layer so the interactive file tools can run
+        # their approval prompt, and only blocked for non-interactive callers
+        # via is_write_approval_required(). Checked before the credential deny
+        # so the ``.ssh/`` directory prefix below doesn't swallow the config.
+        if resolved in build_write_approval_paths(home):
+            return None
+
+        if resolved in build_write_denied_paths(home):
             return "credential"
+        for prefix in build_write_denied_prefixes(home):
+            if resolved.startswith(prefix):
+                return "credential"
 
     mcp_tokens_dir_name = "mcp-tokens"
 
@@ -165,24 +172,25 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # falsify conversation history and invalidate resume/compression state.
         try:
             if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
-                return True
+                return "state"
             sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
             if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
-                return True
+                return "state"
         except Exception:
             pass
-        try:
-            mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
-            if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):
-                return "credential"
-        except Exception:
-            pass
-        try:
-            pairing_real = os.path.realpath(os.path.join(base_real, "pairing"))
-            if resolved == pairing_real or resolved.startswith(pairing_real + os.sep):
-                return "credential"
-        except Exception:
-            pass
+        if not unrestricted:
+            try:
+                mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
+                if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):
+                    return "credential"
+            except Exception:
+                pass
+            try:
+                pairing_real = os.path.realpath(os.path.join(base_real, "pairing"))
+                if resolved == pairing_real or resolved.startswith(pairing_real + os.sep):
+                    return "credential"
+            except Exception:
+                pass
 
     safe_roots = get_safe_write_roots()
     if safe_roots:
@@ -225,6 +233,9 @@ def is_write_approval_required(path: str) -> bool:
     ``ProxyCommand``). Callers with an interactive/gateway channel should
     prompt; callers without one should treat this as a block (fail closed).
     """
+    if is_unrestricted():
+        return False
+
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
     return resolved in build_write_approval_paths(home)
@@ -289,6 +300,9 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``"auth.json"`` would otherwise miss the denylist when the task's
     terminal cwd differs from the process cwd.
     """
+    if is_unrestricted():
+        return None
+
     resolved = Path(path).expanduser().resolve()
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global
@@ -543,6 +557,9 @@ def get_cross_profile_warning(path: str) -> Optional[str]:
     and can write any of these paths without going through this guard.
     Treat the guard as a confusion-reducer, not a security boundary.
     """
+    if is_unrestricted():
+        return None
+
     info = classify_cross_profile_target(path)
     if info is None:
         return None
@@ -651,6 +668,9 @@ def get_sandbox_mirror_warning(path: str) -> Optional[str]:
     exists to surface the misclassification before the silent-success +
     divergent-copy footgun in #32049 fires.
     """
+    if is_unrestricted():
+        return None
+
     info = classify_sandbox_mirror_target(path)
     if info is None:
         return None
@@ -729,6 +749,9 @@ def get_container_mirror_warning(
     non-mirror paths, caller surfaces as a tool-result error. Bypass via
     ``cross_profile=True`` after explicit user direction.
     """
+    if is_unrestricted():
+        return None
+
     info = classify_container_mirror_target(path, mirror_prefix)
     if info is None:
         return None

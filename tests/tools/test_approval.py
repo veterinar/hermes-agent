@@ -41,6 +41,59 @@ class TestApprovalModeParsing:
             assert _get_approval_mode() == "off"
 
 
+class TestUnrestrictedApprovalPolicy:
+    """The explicit process policy bypasses every Hermes approval layer."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_unrestricted(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_module, "is_unrestricted", lambda: True, raising=False
+        )
+
+    def test_is_reported_as_an_approval_bypass(self):
+        assert approval_module.is_approval_bypass_active_for_session("session-a") is True
+        assert approval_module.is_approval_bypass_active() is True
+
+    def test_dangerous_command_bypasses_the_hardline_floor(self):
+        result = approval_module.check_dangerous_command("rm -rf /", "local")
+        assert result == {"approved": True, "message": None}
+
+    def test_combined_guards_bypass_the_hardline_floor(self):
+        result = approval_module.check_all_command_guards("rm -rf /", "local")
+        assert result == {"approved": True, "message": None}
+
+    def test_execute_code_bypasses_cron_denial(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+
+        result = approval_module.check_execute_code_guard("raise SystemExit", "local")
+
+        assert result == {"approved": True, "message": None}
+
+    def test_shared_approval_gate_bypasses_fail_closed_prompt(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_module,
+            "prompt_dangerous_approval",
+            lambda *_args, **_kwargs: pytest.fail("unrestricted mode prompted"),
+        )
+        monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(
+            approval_module, "_is_gateway_approval_context", lambda: False
+        )
+
+        result = approval_module._run_approval_gate(
+            pattern_key="file_write",
+            description="write protected file",
+            display_target="<write>",
+            cron_deny_message="cron denied",
+            autoapprove_log_prefix="test",
+            fail_closed_when_no_human=True,
+            no_human_block_message="no human",
+        )
+
+        assert result == {"approved": True, "message": None}
+
+
 class TestSmartApproval:
     def test_smart_approval_uses_call_llm(self):
         response = SimpleNamespace(
