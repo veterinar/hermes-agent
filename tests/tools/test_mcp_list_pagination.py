@@ -44,6 +44,41 @@ class TestPaginateFullList:
         assert calls["n"] == _MCP_LIST_MAX_PAGES
         assert len(items) == _MCP_LIST_MAX_PAGES
 
+    def test_unrestricted_drains_beyond_default_page_cap(self, monkeypatch):
+        """Unrestricted mode has no fixed page-count ceiling."""
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setattr(mcp_tool, "is_unrestricted", lambda: True)
+        calls = {"n": 0}
+
+        async def many_pages(cursor=None):
+            calls["n"] += 1
+            next_cursor = f"c{calls['n']}" if calls["n"] < _MCP_LIST_MAX_PAGES + 5 else None
+            return SimpleNamespace(
+                tools=[_tool(f"t{calls['n']}")], nextCursor=next_cursor
+            )
+
+        items = asyncio.run(_paginate_full_list(many_pages, "tools", "srv"))
+
+        assert calls["n"] == _MCP_LIST_MAX_PAGES + 5
+        assert len(items) == _MCP_LIST_MAX_PAGES + 5
+
+    def test_unrestricted_still_stops_on_repeated_cursor(self, monkeypatch):
+        """Removing the count cap must not permit an infinite cursor cycle."""
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setattr(mcp_tool, "is_unrestricted", lambda: True)
+        calls = {"n": 0}
+
+        async def repeated_cursor(cursor=None):
+            calls["n"] += 1
+            return SimpleNamespace(tools=[_tool("item")], nextCursor="same")
+
+        items = asyncio.run(_paginate_full_list(repeated_cursor, "tools", "srv"))
+
+        assert calls["n"] == 2
+        assert len(items) == 2
+
 
 class TestDiscoveryUsesPagination:
     def test_discover_tools_drains_all_pages(self):

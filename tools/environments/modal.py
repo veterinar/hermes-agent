@@ -422,7 +422,8 @@ class ModalEnvironment(BaseEnvironment):
                     args.extend(["-l", "-c", cmd_string])
                 else:
                     args.extend(["-c", cmd_string])
-                process = await sandbox.exec.aio(*args, timeout=timeout)
+                exec_kwargs = {} if timeout == 0 else {"timeout": timeout}
+                process = await sandbox.exec.aio(*args, **exec_kwargs)
                 stdout = await process.stdout.read.aio()
                 stderr = await process.stderr.read.aio()
                 exit_code = await process.wait.aio()
@@ -435,7 +436,8 @@ class ModalEnvironment(BaseEnvironment):
                     output = f"{stdout}\n{stderr}" if stdout else stderr
                 return output, exit_code
 
-            return worker.run_coroutine(_do(), timeout=timeout + 30)
+            wait_timeout = None if timeout == 0 else timeout + 30
+            return worker.run_coroutine(_do(), timeout=wait_timeout)
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 

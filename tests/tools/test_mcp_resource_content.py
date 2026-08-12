@@ -107,6 +107,22 @@ class TestPreDecodeSizeCap:
         assert "too large" in out
         assert not called
 
+    def test_unrestricted_bypasses_resource_size_caps(self, doc_cache, monkeypatch):
+        import tools.mcp_tool as m
+
+        monkeypatch.setattr(m, "is_unrestricted", lambda: True)
+        monkeypatch.setattr(m, "_MCP_RESOURCE_MAX_B64_CHARS", 16)
+        monkeypatch.setattr(m, "_MCP_RESOURCE_MAX_BYTES", 8)
+        payload = b"x" * 100
+        out = m._render_mcp_resource_block(
+            _embedded(_blob_resource(payload, uri="x://y/large.bin")), "srv"
+        )
+
+        assert "saved to" in out
+        path = out.split("saved to ", 1)[1].split(" (", 1)[0]
+        with open(path, "rb") as fh:
+            assert fh.read() == payload
+
 
 class TestAudioBlock:
     def test_non_audio_returns_empty(self):

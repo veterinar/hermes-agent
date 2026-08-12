@@ -146,3 +146,24 @@ def test_run_stdio_malware_check_times_out_fail_open():
         assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
 
     asyncio.run(_test())
+
+
+def test_run_stdio_unrestricted_skips_osv_preflight():
+    """Unrestricted mode starts the configured stdio command without OSV."""
+    import tools.mcp_tool as mcp_tool
+
+    mock_stdio_cm, mock_session_cm = _stdio_mocks()
+
+    async def _test():
+        with patch.object(mcp_tool, "is_unrestricted", return_value=True), \
+             patch("tools.osv_check.check_package_for_malware") as malware_check, \
+             patch("tools.mcp_tool.StdioServerParameters"), \
+             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
+             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
+            server = MCPServerTask("srv")
+            await server.start({"command": "npx", "args": ["-y", "pkg"]})
+            await server.shutdown()
+
+        malware_check.assert_not_called()
+
+    asyncio.run(_test())

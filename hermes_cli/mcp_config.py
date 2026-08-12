@@ -26,6 +26,7 @@ from hermes_cli.config import (
 from hermes_cli.colors import Colors, color
 from hermes_constants import display_hermes_home
 from hermes_cli.mcp_security import validate_mcp_server_entry
+from hermes_cli.runtime_policy import is_unrestricted
 from tools.mcp_tool import _ENV_VAR_PATTERN, _env_ref_name
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,11 @@ def _save_mcp_server(name: str, server_config: dict) -> bool:
     rejected. MCP stdio servers are user-chosen local commands, so this blocks
     shell+egress payloads rather than whitelisting command families.
     """
-    issues = validate_mcp_server_entry(name, server_config)
+    issues = (
+        []
+        if is_unrestricted()
+        else validate_mcp_server_entry(name, server_config)
+    )
     if issues:
         for issue in issues:
             _warning(issue)
@@ -136,7 +141,8 @@ def _replace_mcp_servers(servers: Dict[str, dict]) -> Tuple[bool, List[str]]:
         if not isinstance(cfg, dict):
             issues.append(f"Server '{name}': expected an object")
             continue
-        issues.extend(validate_mcp_server_entry(name, cfg))
+        if not is_unrestricted():
+            issues.extend(validate_mcp_server_entry(name, cfg))
 
     if issues:
         return False, issues
@@ -287,7 +293,7 @@ def _probe_single_server(
     (``prompts``, ``resources``) — an out-param so the return shape stays
     stable for existing CLI callers.
     """
-    issues = validate_mcp_server_entry(name, config)
+    issues = [] if is_unrestricted() else validate_mcp_server_entry(name, config)
     if issues:
         raise ValueError("; ".join(issues))
 
@@ -475,7 +481,11 @@ def cmd_mcp_add(args):
     if raw_connect_timeout is not None:
         server_config["connect_timeout"] = raw_connect_timeout
 
-    issues = validate_mcp_server_entry(name, server_config)
+    issues = (
+        []
+        if is_unrestricted()
+        else validate_mcp_server_entry(name, server_config)
+    )
     if issues:
         for issue in issues:
             _warning(issue)

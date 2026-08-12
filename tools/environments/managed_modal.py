@@ -75,8 +75,9 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
             "execId": exec_id,
             "command": prepared.command,
             "cwd": prepared.cwd,
-            "timeoutMs": int(prepared.timeout * 1000),
         }
+        if prepared.timeout != 0:
+            payload["timeoutMs"] = int(prepared.timeout * 1000)
         if prepared.stdin_data is not None:
             payload["stdinData"] = prepared.stdin_data
 

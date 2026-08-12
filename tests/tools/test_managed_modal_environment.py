@@ -193,3 +193,42 @@ def test_managed_modal_execute_times_out_and_cancels(monkeypatch):
         "returncode": 124,
     }
     assert any(call[0] == "POST" and call[1].endswith("/cancel") for call in calls)
+
+
+def test_managed_modal_unrestricted_zero_timeout_has_no_deadline(monkeypatch):
+    _install_fake_tools_package()
+    managed_modal = _load_tool_module("tools.environments.managed_modal", "environments/managed_modal.py")
+    modal_common = sys.modules["tools.environments.modal_utils"]
+
+    calls = []
+    poll_count = {"value": 0}
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        calls.append((method, url, json, timeout))
+        if method == "POST" and url.endswith("/v1/sandboxes"):
+            return _FakeResponse(200, {"id": "sandbox-1"})
+        if method == "POST" and url.endswith("/execs"):
+            assert "timeoutMs" not in json
+            return _FakeResponse(202, {"execId": json["execId"], "status": "running"})
+        if method == "GET" and "/execs/" in url:
+            poll_count["value"] += 1
+            if poll_count["value"] == 1:
+                return _FakeResponse(200, {"status": "running"})
+            return _FakeResponse(200, {
+                "status": "completed",
+                "output": "done",
+                "returncode": 0,
+            })
+        if method == "POST" and url.endswith("/terminate"):
+            return _FakeResponse(200, {"status": "terminated"})
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+    monkeypatch.setattr(managed_modal.requests, "request", fake_request)
+    monkeypatch.setattr(modal_common.time, "sleep", lambda _: None)
+
+    env = managed_modal.ManagedModalEnvironment(image="python:3.11")
+    result = env.execute("sleep forever", timeout=0)
+    env.cleanup()
+
+    assert result == {"output": "done", "returncode": 0}
+    assert poll_count["value"] == 2

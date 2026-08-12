@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+import agent.redact as redact_module
 from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
 
 
@@ -13,6 +14,15 @@ def _ensure_redaction_enabled(monkeypatch):
     monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
     # Also patch the module-level snapshot so it reflects the cleared env var
     monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_unrestricted_policy_bypasses_all_secret_redaction(monkeypatch, force):
+    fake_key = "sk-" + "A" * 24
+    text = f"provider error {fake_key}"
+    monkeypatch.setattr(redact_module, "is_unrestricted", lambda: True, raising=False)
+
+    assert redact_sensitive_text(text, force=force) == text
 
 
 class TestKnownPrefixes:

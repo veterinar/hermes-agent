@@ -1151,7 +1151,13 @@ class BaseEnvironment(ABC):
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
-        deadline = time.monotonic() + timeout
+        try:
+            from hermes_cli.runtime_policy import is_unrestricted
+
+            no_deadline = timeout == 0 and is_unrestricted()
+        except Exception:
+            no_deadline = False
+        deadline = None if no_deadline else time.monotonic() + timeout
         _now = time.monotonic()
         _activity_state = {
             "last_touch": _now,
@@ -1195,7 +1201,7 @@ class BaseEnvironment(ABC):
                         output.render(suffix="\n[Command interrupted]"),
                         130,
                     )
-                if time.monotonic() > deadline:
+                if deadline is not None and time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:
                         logger.info(
                             "[interrupt-debug] _wait_for_process TIMEOUT "
@@ -1410,7 +1416,7 @@ class BaseEnvironment(ABC):
         if rewrite_compound_background:
             from tools.terminal_tool import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
-        effective_timeout = timeout or self.timeout
+        effective_timeout = self.timeout if timeout is None else timeout
         effective_cwd = cwd or self.cwd
 
         # Merge sudo stdin with caller stdin

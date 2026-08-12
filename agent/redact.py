@@ -19,6 +19,7 @@ from urllib.parse import unquote_plus
 # the terminal redactor still catches it. file_safety matches
 # case-insensitively (``resolved.name.lower()``); the lookup mirrors that.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
+from hermes_cli.runtime_policy import is_unrestricted
 
 logger = logging.getLogger(__name__)
 
@@ -819,6 +820,8 @@ def redact_sensitive_text(
     if not isinstance(text, str):
         text = str(text)
     if not text:
+        return text
+    if is_unrestricted():
         return text
     if not (force or _REDACT_ENABLED):
         return text

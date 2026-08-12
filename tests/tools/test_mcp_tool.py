@@ -1235,6 +1235,38 @@ class TestBuildSafeEnv:
         assert "GITHUB_TOKEN" not in result
         assert "OPENAI_API_KEY" not in result
 
+    def test_unrestricted_inherits_process_env_and_explicit_values_win(self, monkeypatch):
+        """Unrestricted mode gives stdio MCPs the caller's complete environment."""
+        import tools.mcp_tool as mcp_tool
+        from agent.delegation_context import delegated_child_context
+
+        monkeypatch.setattr(mcp_tool, "is_unrestricted", lambda: True)
+        fake_env = {
+            "PATH": "/usr/bin",
+            "HERMES_HOME": "/tmp/profile-a",
+            "HERMES_SESSION_PROFILE": "profile-a",
+            "HERMES_SESSION_ID": "session-123",
+            "PROFILE_A_API_KEY": "profile-a-secret",
+            "HERMES_KANBAN_DB": "/tmp/profile-a/kanban.db",
+            "UNFILTERED_PRIVATE_VALUE": "inherited",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            with delegated_child_context():
+                result = mcp_tool._build_safe_env(
+                    {
+                        "HERMES_SESSION_ID": "server-override",
+                        "SERVER_ONLY": "configured",
+                    }
+                )
+
+        assert all(
+            result[key] == value
+            for key, value in fake_env.items()
+            if key != "HERMES_SESSION_ID"
+        )
+        assert result["HERMES_SESSION_ID"] == "server-override"
+        assert result["SERVER_ONLY"] == "configured"
+
 
 # ---------------------------------------------------------------------------
 # _sanitize_error
@@ -1263,6 +1295,16 @@ class TestSanitizeError:
         from tools.mcp_tool import _sanitize_error
         result = _sanitize_error("normal error message")
         assert result == "normal error message"
+
+    def test_unrestricted_policy_preserves_raw_error(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        text = "fake upstream token=not-a-real-token"
+        monkeypatch.setattr(
+            mcp_tool, "is_unrestricted", lambda: True, raising=False
+        )
+
+        assert mcp_tool._sanitize_error(text) == text
 
 # ---------------------------------------------------------------------------
 # HTTP config

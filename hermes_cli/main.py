@@ -729,6 +729,8 @@ try:
             _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
         except Exception:
             pass
+        from hermes_cli.runtime_policy import bridge_unrestricted_to_env
+        bridge_unrestricted_to_env(_early_cfg_raw)
         if "HERMES_REDACT_SECRETS" not in os.environ:
             _early_sec_cfg = _early_cfg_raw.get("security", {})
             if isinstance(_early_sec_cfg, dict):

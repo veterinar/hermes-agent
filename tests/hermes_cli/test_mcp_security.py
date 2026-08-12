@@ -12,10 +12,13 @@ import pytest
 def _isolate_config(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import hermes_cli.config as config_mod
+    from hermes_cli.runtime_policy import reset_unrestricted_for_tests
 
     config_mod._LOAD_CONFIG_CACHE.clear()
     config_mod._RAW_CONFIG_CACHE.clear()
-    return tmp_path
+    reset_unrestricted_for_tests()
+    yield tmp_path
+    reset_unrestricted_for_tests()
 
 
 def _dangerous_entry():
@@ -64,6 +67,32 @@ def test_validator_flags_ssh_key_persistence_payload():
     # Either the IOC blocklist (hermes-0day key) or the persistence rule fires.
     joined = " ".join(warnings).lower()
     assert "indicator-of-compromise" in joined or "persistence" in joined
+
+
+def test_unrestricted_validator_allows_operator_selected_entry(monkeypatch):
+    import hermes_cli.mcp_security as mcp_security
+
+    monkeypatch.setattr(mcp_security, "is_unrestricted", lambda: True)
+
+    assert mcp_security.validate_mcp_server_entry("operator-selected", _dangerous_entry()) == []
+
+
+def test_unrestricted_runtime_filter_keeps_operator_selected_entry(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    monkeypatch.setattr(mcp_tool, "is_unrestricted", lambda: True)
+    servers = {"operator-selected": _dangerous_entry()}
+
+    assert mcp_tool._filter_suspicious_mcp_servers(servers) == servers
+
+
+def test_unrestricted_save_persists_operator_selected_entry(monkeypatch):
+    import hermes_cli.mcp_config as mcp_config
+
+    monkeypatch.setattr(mcp_config, "is_unrestricted", lambda: True)
+
+    assert mcp_config._save_mcp_server("operator-selected", _dangerous_entry()) is True
+    assert mcp_config._get_mcp_servers()["operator-selected"] == _dangerous_entry()
 
 
 
@@ -143,6 +172,32 @@ def test_migration_disables_existing_dangerous_entry(tmp_path):
 
     assert "Disabled suspicious MCP server 'evil'" in result["warnings"]
     assert config["mcp_servers"]["evil"]["enabled"] is False
+
+
+def test_unrestricted_migration_preserves_operator_selected_entry(tmp_path):
+    import yaml
+
+    from hermes_cli.config import load_config, migrate_config
+    from hermes_cli.runtime_policy import reset_unrestricted_for_tests
+
+    config_path = Path(tmp_path) / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "_config_version": 29,
+                "security": {"unrestricted": True},
+                "mcp_servers": {"chosen": _dangerous_entry()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reset_unrestricted_for_tests()
+
+    result = migrate_config(interactive=False, quiet=True)
+    config = load_config()
+
+    assert "Disabled suspicious MCP server 'chosen'" not in result["warnings"]
+    assert config["mcp_servers"]["chosen"].get("enabled", True) is True
 
 
 

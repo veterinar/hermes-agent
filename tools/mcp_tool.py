@@ -116,6 +116,7 @@ from datetime import datetime
 from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from hermes_cli.runtime_policy import is_unrestricted
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -590,6 +591,14 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     its subprocesses can consume those credentials without duplicating them
     in every MCP server's ``env:`` block.
     """
+    if is_unrestricted():
+        # Literal full inheritance. Do not apply MCP allowlists or rewrite
+        # profile/session/delegation variables; explicit server env wins.
+        env = dict(os.environ)
+        if user_env:
+            env.update(user_env)
+        return env
+
     try:
         from hermes_cli.env_loader import get_secret_source
     except Exception:  # pragma: no cover — early bootstrap/import fallback
@@ -614,6 +623,8 @@ def _sanitize_error(text: str) -> str:
     Replaces tokens, keys, and other secrets with [REDACTED] to prevent
     accidental credential exposure in tool error responses.
     """
+    if is_unrestricted():
+        return text
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
@@ -765,20 +776,33 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str):
     """
     items: list = []
     cursor = None
-    for _ in range(_MCP_LIST_MAX_PAGES):
+    seen_cursors: set[str] = set()
+    page_count = 0
+    while True:
         result = await (list_method(cursor=cursor) if cursor else list_method())
+        page_count += 1
         items.extend(getattr(result, items_attr, None) or [])
-        cursor = getattr(result, "nextCursor", None)
+        next_cursor = getattr(result, "nextCursor", None)
         # Per the MCP spec the cursor is an opaque string; anything else
         # (including mock objects in tests) means "no more pages".
-        if not isinstance(cursor, str) or not cursor:
+        if not isinstance(next_cursor, str) or not next_cursor:
             break
-    else:
-        logger.warning(
-            "MCP server '%s': %s pagination exceeded %d pages; "
-            "truncating at %d items",
-            server_name, items_attr, _MCP_LIST_MAX_PAGES, len(items),
-        )
+        if next_cursor in seen_cursors:
+            logger.warning(
+                "MCP server '%s': %s pagination repeated cursor %r; "
+                "stopping after %d pages",
+                server_name, items_attr, next_cursor, page_count,
+            )
+            break
+        seen_cursors.add(next_cursor)
+        if not is_unrestricted() and page_count >= _MCP_LIST_MAX_PAGES:
+            logger.warning(
+                "MCP server '%s': %s pagination exceeded %d pages; "
+                "truncating at %d items",
+                server_name, items_attr, _MCP_LIST_MAX_PAGES, len(items),
+            )
+            break
+        cursor = next_cursor
     return items
 
 
@@ -996,14 +1020,14 @@ def _cache_mcp_audio_block(block) -> str:
     mime_type = str(getattr(block, "mimeType", None) or "").split(";", 1)[0].strip().lower()
     if data is None or not mime_type.startswith("audio/"):
         return ""
-    if len(data) > _MCP_RESOURCE_MAX_B64_CHARS:
+    if not is_unrestricted() and len(data) > _MCP_RESOURCE_MAX_B64_CHARS:
         return f"[MCP audio resource too large to cache: ~{len(data) * 3 // 4} bytes]"
     try:
         raw_bytes = base64.b64decode(data)
     except (TypeError, ValueError) as exc:
         logger.warning("MCP audio block decode failed (%s): %s", mime_type, exc)
         return ""
-    if len(raw_bytes) > _MCP_RESOURCE_MAX_BYTES:
+    if not is_unrestricted() and len(raw_bytes) > _MCP_RESOURCE_MAX_BYTES:
         return f"[MCP audio resource too large to cache: {len(raw_bytes)} bytes]"
     try:
         from gateway.platforms.base import cache_audio_from_bytes
@@ -1076,14 +1100,14 @@ def _render_mcp_resource_block(block, server_name: str = "") -> str:
 
     uri = str(getattr(resource, "uri", "") or "")
     mime = str(getattr(resource, "mimeType", "") or "")
-    if len(blob) > _MCP_RESOURCE_MAX_B64_CHARS:
+    if not is_unrestricted() and len(blob) > _MCP_RESOURCE_MAX_B64_CHARS:
         return f"[MCP embedded resource too large to cache: ~{len(blob) * 3 // 4} bytes, uri={uri}]"
     try:
         raw_bytes = base64.b64decode(blob)
     except (TypeError, ValueError) as exc:
         logger.warning("MCP embedded resource decode failed (%s): %s", mime or uri, exc)
         return f"[MCP embedded resource could not be decoded: {mime or uri}]"
-    if len(raw_bytes) > _MCP_RESOURCE_MAX_BYTES:
+    if not is_unrestricted() and len(raw_bytes) > _MCP_RESOURCE_MAX_BYTES:
         return f"[MCP embedded resource too large to cache: {len(raw_bytes)} bytes, uri={uri}]"
     try:
         from gateway.platforms.base import cache_document_from_bytes
@@ -2668,23 +2692,24 @@ class MCPServerTask:
         # NOTE: must run against the REAL command/args — the watchdog wrap
         # below rewrites argv to `python -m tools.mcp_stdio_watchdog …`,
         # which would silently turn the preflight into a no-op.
-        from tools.osv_check import check_package_for_malware
-        try:
-            malware_error = await asyncio.wait_for(
-                asyncio.to_thread(check_package_for_malware, command, args),
-                timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "MCP server '%s': OSV malware preflight timed out after %.0fs "
-                "(network slow/unreachable) — proceeding without the check.",
-                self.name, _OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
-            malware_error = None
-        if malware_error:
-            raise ValueError(
-                f"MCP server '{self.name}': {malware_error}"
-            )
+        if not is_unrestricted():
+            from tools.osv_check import check_package_for_malware
+            try:
+                malware_error = await asyncio.wait_for(
+                    asyncio.to_thread(check_package_for_malware, command, args),
+                    timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "MCP server '%s': OSV malware preflight timed out after %.0fs "
+                    "(network slow/unreachable) — proceeding without the check.",
+                    self.name, _OSV_MALWARE_CHECK_TIMEOUT_S,
+                )
+                malware_error = None
+            if malware_error:
+                raise ValueError(
+                    f"MCP server '{self.name}': {malware_error}"
+                )
 
         # Wrap the real command in a parent-death watchdog supervisor so an
         # ungraceful exit of this Hermes process (kill -9, crash, force-quit)
@@ -5067,6 +5092,8 @@ def _warn_hidden_whitespace(server_name: str, config: dict) -> List[str]:
 
 def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
     """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
+    if is_unrestricted():
+        return servers
     try:
         from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
     except Exception:
