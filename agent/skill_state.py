@@ -113,7 +113,10 @@ def _validate_doc(doc: Any) -> Dict[str, Any]:
 
 
 def _open_state_read(path: Path) -> Tuple[Any, os.stat_result]:
-    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise SkillStateError(f"cannot open state file: {exc}")
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -274,7 +277,7 @@ def _patch_signature(patch: Dict[str, Any], assistant_msg: Dict[str, Any]) -> st
         if isinstance(c, dict)
     )
     digest = hashlib.sha256(canonical_json(patch).encode("utf-8"))
-    digest.update("\x00".join(call_ids))
+    digest.update("\x00".join(call_ids).encode("utf-8"))
     return digest.hexdigest()
 
 
