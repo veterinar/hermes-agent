@@ -893,6 +893,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
+    # Opt-in task-local skill-state protocol (VetClub author route). Added
+    # ONLY at initial prompt build, when the mode is active, so the prompt
+    # stays byte-stable for the session (prompt-cache safe).
+    try:
+        from agent.skill_state import resolve_skill_state_path as _rssp
+
+        if _rssp() is not None:
+            from agent.skill_state import skill_state_protocol_instruction
+
+            stable_parts.append(skill_state_protocol_instruction())
+    except Exception:
+        pass
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
