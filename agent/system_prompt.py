@@ -1026,6 +1026,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
+    _instruction = None
+    try:
+        from agent.skill_state import protocol_instruction
+
+        _instruction = protocol_instruction()
+    except Exception:
+        _instruction = None
+    if _instruction:
+        stable_parts.append(_instruction)
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
