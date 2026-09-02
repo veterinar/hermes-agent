@@ -2503,6 +2503,17 @@ def run_conversation(
                 am["content"] = am["content"].strip()
         _canonicalize_api_tool_calls(api_messages)
 
+        # Opt-in task-local skill-state compaction (VetClub author route).
+        # Identity when HERMES_SKILL_STATE_PATH is unset/invalid; otherwise
+        # projects the request to [system] + [task + canonical state] +
+        # [latest complete tool-call observation] after a valid state patch.
+        # Request-only: the persisted `messages` sequence is untouched, and
+        # ANY doubt (no patch, bad patch, incomplete results, unreadable
+        # state) returns the full-history list unchanged.
+        from agent.skill_state import maybe_project_skill_state as _maybe_ss
+
+        api_messages = _maybe_ss(agent, api_messages)
+
         # Proactively strip any surrogate characters before the API call.
         # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
