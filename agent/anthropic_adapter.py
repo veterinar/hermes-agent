@@ -474,6 +474,14 @@ _CONTEXT_1M_BETA = "context-1m-2025-08-07"
 # See https://platform.claude.com/docs/en/build-with-claude/fast-mode
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
+# Claude Fable 5.1 native-route betas. ``thinking.display="updates"``
+# streams live reasoning progress; the mid-conversation system row with
+# ``clear_at`` scopes a turn's ephemeral system prompt to the next user
+# message. Both are native-Anthropic-only — third-party Anthropic-compatible
+# endpoints keep the legacy shapes.
+_FABLE_THINKING_DISPLAY_BETA = "thinking-display-updates-2026-08-18"
+_FABLE_MID_CONVERSATION_SYSTEM_BETA = "mid-conversation-system-clear-at-2026-08-21"
+
 # Additional beta headers required for OAuth/subscription auth.
 # Matches what Claude Code (and pi-ai / OpenCode) send.
 _OAUTH_ONLY_BETAS = [
@@ -608,6 +616,88 @@ def _common_betas_for_base_url(
     if drop_context_1m_beta:
         return [b for b in betas if b != _CONTEXT_1M_BETA]
     return betas
+
+
+def _is_native_fable_5_1(model: str, base_url: str | None) -> bool:
+    """True only for direct/native Anthropic requests for Claude Fable 5.1.
+
+    Matches the normalized slug ``claude-fable-5-1`` (the normal
+    ``anthropic/`` prefix form included, since normalization strips it).
+    Third-party Anthropic-compatible endpoints and every other model are
+    excluded — they keep the legacy request shapes.
+    """
+    if _is_third_party_anthropic_endpoint(base_url):
+        return False
+    return normalize_model_name(model).lower() == "claude-fable-5-1"
+
+
+def split_clear_at_system_row(
+    messages: List[Dict],
+) -> Tuple[Optional[Dict], List[Dict]]:
+    """Separate a turn-scoped ``clear_at`` system row from ordinary messages.
+
+    The Fable 5.1 native route scopes ``agent.ephemeral_system_prompt`` to a
+    trailing mid-conversation system row
+    (``{"role": "system", "content": ..., "clear_at": "next_user_message"}``).
+    ``convert_messages_to_anthropic`` extracts *every* system row into the
+    top-level ``system`` param, so the caller must pull this row out before
+    conversion and append it back to the Anthropic ``messages`` list at the
+    same trailing position. Returns ``(row_or_None, remaining_messages)``.
+    """
+    remaining: List[Dict] = []
+    row: Optional[Dict] = None
+    for m in messages:
+        if (
+            row is None
+            and isinstance(m, dict)
+            and m.get("role") == "system"
+            and m.get("clear_at") == "next_user_message"
+        ):
+            row = m
+        else:
+            remaining.append(m)
+    return row, remaining
+
+
+def assemble_ephemeral_system_messages(
+    base_system: str,
+    ephemeral_system_prompt: str | None,
+    *,
+    model: str,
+    base_url: str | None,
+) -> Tuple[Optional[Dict], List[Dict]]:
+    """Shared seam for the ephemeral system prompt request shape.
+
+    Returns ``(leading_system_message_or_None, trailing_rows)``.
+
+    Legacy behavior on every route except native Claude Fable 5.1: the
+    ephemeral prompt is concatenated onto the stable system prompt as a
+    single leading ``{"role": "system"}`` row, leaving the prompt-cache
+    contract untouched.
+
+    Native Fable 5.1: the stable system prompt ships alone as the leading
+    row (byte-identical — the ephemeral text is never concatenated into it)
+    and the ephemeral prompt becomes a trailing mid-conversation row
+    ``{"role": "system", "content": <prompt>, "clear_at":
+    "next_user_message"}`` that Anthropic clears at the next user message.
+    A nonempty *ephemeral_system_prompt* on that route always yields the
+    trailing row, even when *base_system* is empty.
+    """
+    base = base_system or ""
+    eph = (ephemeral_system_prompt or "").strip()
+    if not eph:
+        if base:
+            return {"role": "system", "content": base}, []
+        return None, []
+    if _is_native_fable_5_1(model, base_url):
+        leading = {"role": "system", "content": base} if base else None
+        return leading, [{
+            "role": "system",
+            "content": eph,
+            "clear_at": "next_user_message",
+        }]
+    combined = (base + "\n\n" + eph).strip()
+    return {"role": "system", "content": combined}, []
 
 
 def _build_anthropic_client_with_bearer_hook(
@@ -938,7 +1028,15 @@ def build_anthropic_kwargs(
     fast-mode beta header for ~2.5x faster output throughput on Opus 4.6.
     Currently only supported on native Anthropic endpoints (not third-party
     compatible ones).
+
+    On the native Claude Fable 5.1 route (direct Anthropic, normalized slug
+    ``claude-fable-5-1``), adaptive thinking sends
+    ``display="updates"`` and a turn-scoped ``clear_at`` mid-conversation
+    system row is preserved in ``messages``; each adds its beta header
+    exactly once. Third-party endpoints and other models keep the legacy
+    shapes.
     """
+    clear_at_row, messages = split_clear_at_system_row(messages)
     system, anthropic_messages = convert_messages_to_anthropic(
         messages, base_url=base_url, model=model
     )
@@ -1123,7 +1221,11 @@ def build_anthropic_kwargs(
             if _supports_adaptive_thinking(model):
                 kwargs["thinking"] = {
                     "type": "adaptive",
-                    "display": "summarized",
+                    "display": (
+                        "updates"
+                        if _is_native_fable_5_1(model, base_url)
+                        else "summarized"
+                    ),
                 }
                 adaptive_effort = ADAPTIVE_EFFORT_MAP.get(effort, "medium")
                 # Downgrade xhigh→max on models that don't list xhigh as a
@@ -1154,12 +1256,33 @@ def build_anthropic_kwargs(
     # Opus 4.6 — Opus 4.7 and other models 400 on the speed parameter.
     # Only for native Anthropic endpoints — third-party providers would
     # reject the unknown beta header and speed parameter.
+    #
+    # ── Claude Fable 5.1 (native route) betas ─────────────────────────
+    # One per-request beta list: when any Fable-gated beta applies we
+    # emit extra_headers explicitly (they override the client-level
+    # anthropic-beta header), seeded from the common/OAuth betas so the
+    # rest of the surface stays identical. No duplicates.
+    _fable_native = _is_native_fable_5_1(model, base_url)
+    _fable_betas: list[str] = []
+    if _fable_native:
+        if kwargs.get("thinking", {}).get("type") == "adaptive":
+            _fable_betas.append(_FABLE_THINKING_DISPLAY_BETA)
+        if clear_at_row is not None:
+            _fable_betas.append(_FABLE_MID_CONVERSATION_SYSTEM_BETA)
+            # The turn-scoped system row survives as a trailing
+            # mid-conversation message, not as top-level `system`.
+            kwargs["messages"] = [*anthropic_messages, dict(clear_at_row)]
+    need_extra_betas = bool(_fable_betas)
+
     if (
         fast_mode
         and not _is_third_party_anthropic_endpoint(base_url)
         and _supports_fast_mode(model)
     ):
         kwargs.setdefault("extra_body", {})["speed"] = "fast"
+        need_extra_betas = True
+
+    if need_extra_betas:
         # Build extra_headers with ALL applicable betas (the per-request
         # extra_headers override the client-level anthropic-beta header).
         betas = list(_common_betas_for_base_url(
@@ -1168,7 +1291,14 @@ def build_anthropic_kwargs(
         ))
         if is_oauth:
             betas.extend(_OAUTH_ONLY_BETAS)
-        betas.append(_FAST_MODE_BETA)
+        if fast_mode and not _is_third_party_anthropic_endpoint(base_url) \
+                and _supports_fast_mode(model):
+            betas.append(_FAST_MODE_BETA)
+        betas.extend(_fable_betas)
+        # De-duplicate while preserving order (e.g. a beta already present
+        # in the common/OAuth lists must appear exactly once).
+        seen = set()
+        betas = [b for b in betas if not (b in seen or seen.add(b))]
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs

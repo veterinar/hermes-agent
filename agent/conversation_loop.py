@@ -1677,6 +1677,33 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
+    # Turn-scoped system row (native Claude Fable 5.1): the stable prefix is
+    # rewritten in place while the trailing ``clear_at`` row is rebuilt
+    # around the non-system messages via the shared seam, so failover
+    # reassembly cannot drift from initial assembly.
+    from agent.anthropic_adapter import assemble_ephemeral_system_messages
+
+    _has_clear_at = any(
+        isinstance(m, dict)
+        and m.get("role") == "system"
+        and m.get("clear_at") == "next_user_message"
+        for m in api_messages
+    )
+    if _has_clear_at:
+        _leading, _trailing = assemble_ephemeral_system_messages(
+            sp,
+            getattr(agent, "ephemeral_system_prompt", None),
+            model=getattr(agent, "model", ""),
+            base_url=getattr(agent, "base_url", None),
+        )
+        _non_system = [m for m in api_messages if not (
+            isinstance(m, dict) and m.get("role") == "system"
+        )]
+        if _leading is not None:
+            api_messages[:] = [_leading, *_non_system, *_trailing]
+        else:
+            api_messages[:] = [*_non_system, *_trailing]
+        return sp
     if api_messages and api_messages[0].get("role") == "system":
         effective = sp
         if agent.ephemeral_system_prompt:
@@ -2557,9 +2584,24 @@ def run_conversation(
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
+            from agent.anthropic_adapter import assemble_ephemeral_system_messages
+
+            _lead_sys, _trailing_sys = assemble_ephemeral_system_messages(
+                effective_system,
+                agent.ephemeral_system_prompt,
+                model=getattr(agent, "model", ""),
+                base_url=getattr(agent, "base_url", None),
+            )
+        else:
+            _lead_sys = (
+                {"role": "system", "content": effective_system}
+                if effective_system else None
+            )
+            _trailing_sys = []
+        if _lead_sys is not None:
+            api_messages = [_lead_sys, *api_messages]
+        if _trailing_sys:
+            api_messages = [*api_messages, *_trailing_sys]
 
         if moa_config:
             try:

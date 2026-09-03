@@ -1028,6 +1028,115 @@ class TestBuildAnthropicKwargs:
         assert _get_anthropic_max_output("anthropic/claude-fable-5") == 128_000
 
 
+class TestNativeFable51RequestShape:
+    """Native Claude Fable 5.1 route: thinking display updates + turn-scoped
+    (``clear_at``) ephemeral system row, each with its beta exactly once."""
+
+    FABLE_BETAS = (
+        "thinking-display-updates-2026-08-18",
+        "mid-conversation-system-clear-at-2026-08-21",
+    )
+
+    def _fable_messages(self, stable="You are Hermes.", eph="Extra turn guidance."):
+        from agent.anthropic_adapter import assemble_ephemeral_system_messages
+
+        lead, trailing = assemble_ephemeral_system_messages(
+            stable, eph, model="claude-fable-5-1", base_url=None,
+        )
+        msgs = []
+        if lead is not None:
+            msgs.append(lead)
+        msgs.append({"role": "user", "content": "hello"})
+        msgs.extend(trailing)
+        return msgs
+
+    def test_native_fable_thinking_display_and_beta_uniqueness(self):
+        kwargs = build_anthropic_kwargs(
+            model="anthropic/claude-fable-5-1",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kwargs["thinking"]["type"] == "adaptive"
+        assert kwargs["thinking"]["display"] == "updates"
+        betas = kwargs["extra_headers"]["anthropic-beta"].split(",")
+        assert betas.count("thinking-display-updates-2026-08-18") == 1
+        assert "mid-conversation-system-clear-at-2026-08-21" not in betas
+
+    def test_native_fable_clear_at_row_stays_trailing_with_beta(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-fable-5-1",
+            messages=self._fable_messages(),
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        msgs = kwargs["messages"]
+        # Trailing mid-conversation system row preserved verbatim.
+        assert msgs[-1]["role"] == "system"
+        assert msgs[-1]["content"] == "Extra turn guidance."
+        assert msgs[-1]["clear_at"] == "next_user_message"
+        # Stable prompt is the top-level system, never the ephemeral text.
+        assert "Extra turn guidance." not in json.dumps(kwargs["system"])
+        assert "You are Hermes." in json.dumps(kwargs["system"])
+        betas = kwargs["extra_headers"]["anthropic-beta"].split(",")
+        for b in self.FABLE_BETAS:
+            assert betas.count(b) == 1, b
+        # Common betas retained alongside the Fable ones.
+        assert "interleaved-thinking-2025-05-14" in betas
+
+    def test_third_party_endpoint_keeps_legacy_shapes(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-fable-5-1",
+            messages=self._fable_messages(),
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "high"},
+            base_url="https://proxy.example.com/anthropic",
+        )
+        assert kwargs["thinking"]["display"] == "summarized"
+        assert "extra_headers" not in kwargs
+        # The trailing system row was extracted to top-level system as before.
+        assert "clear_at" not in json.dumps(kwargs.get("messages", []))
+
+    def test_other_native_models_keep_summarized_display(self):
+        for model in ("claude-opus-4-7", "claude-fable-5", "claude-fable-5-2"):
+            kwargs = build_anthropic_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                tools=None,
+                max_tokens=4096,
+                reasoning_config={"enabled": True, "effort": "high"},
+            )
+            assert kwargs["thinking"]["display"] == "summarized", model
+            assert "extra_headers" not in kwargs, model
+
+    def test_assemble_seam_concatenates_off_fable_route(self):
+        from agent.anthropic_adapter import assemble_ephemeral_system_messages
+
+        # Other model — legacy concatenation, stable bytes include eph text.
+        lead, trailing = assemble_ephemeral_system_messages(
+            "stable", "eph", model="claude-opus-4-7", base_url=None,
+        )
+        assert lead["content"] == "stable\n\neph"
+        assert trailing == []
+        # Third-party base URL even with the Fable slug — legacy shape.
+        lead, trailing = assemble_ephemeral_system_messages(
+            "stable", "eph",
+            model="claude-fable-5-1",
+            base_url="https://proxy.example.com/anthropic",
+        )
+        assert lead["content"] == "stable\n\neph"
+        assert trailing == []
+        # No ephemeral prompt — unchanged single stable row.
+        lead, trailing = assemble_ephemeral_system_messages(
+            "stable", None, model="claude-fable-5-1", base_url=None,
+        )
+        assert lead == {"role": "system", "content": "stable"}
+        assert trailing == []
+
+
 
     def test_non_claude_anthropic_models_use_manual_path(self):
         """Non-Claude Anthropic-Messages models (minimax, qwen3, glm) must not
