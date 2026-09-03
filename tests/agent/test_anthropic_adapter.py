@@ -1151,7 +1151,11 @@ class TestNativeFable51HistoricalClearAtRegressions:
         return [
             {"role": "system", "content": "You are Hermes."},
             {"role": "user", "content": "turn one"},
-            {"role": "assistant", "content": "answer one"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "answer one"},
+                {"type": "tool_use", "id": "t1", "name": "lookup",
+                 "input": {"q": "one"}},
+            ]},
             {"role": "system", "content": "Turn-one guidance.",
              "clear_at": "next_user_message"},
             {"role": "user", "content": [

@@ -11743,6 +11743,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return carrier.get("clear_at")
         return None
 
+    @classmethod
+    def _normalize_raw_clear_at_row(cls, msg: Dict[str, Any]) -> None:
+        """Normalize a raw ``get_messages`` row carrying the private marker.
+
+        Raw rows are fed straight back into writes (fork handlers, import);
+        a physical clear_at system row must therefore come back the way it
+        went in — ``clear_at`` re-attached on the row, the private carrier
+        key stripped from its display metadata — or an unchanged round trip
+        looks divergent to the replace_messages sweep and clears opaque
+        sidecars. Legacy folded carriers on host rows are simply stripped
+        (conversation replay re-materializes them).
+        """
+        meta = msg.get("display_metadata")
+        if not isinstance(meta, dict) or cls._CLEAR_AT_CARRIER_KEY not in meta:
+            return
+        carrier = meta.pop(cls._CLEAR_AT_CARRIER_KEY)
+        if not meta:
+            msg.pop("display_metadata", None)
+        if msg.get("role") == "system":
+            clear_at = cls._normalized_clear_at_marker(
+                {cls._CLEAR_AT_CARRIER_KEY: carrier}
+            )
+            if clear_at:
+                msg["clear_at"] = clear_at
+
     @staticmethod
     def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
         """Serialize ``display_metadata`` for its TEXT column without double-encoding.
@@ -13235,6 +13260,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     msg["tool_calls"] = []
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+                self._normalize_raw_clear_at_row(msg)
             result.append(msg)
         return result
 
