@@ -1137,6 +1137,225 @@ class TestNativeFable51RequestShape:
         assert trailing == []
 
 
+class TestNativeFable51HistoricalClearAtRegressions:
+    """Focused regressions for the Fable 5.1 wire correction: in-position
+    historical clear_at rows, non-Fable isolation, failover preservation,
+    signed thinking replay, empty progress, and legacy whitespace."""
+
+    MID_BETA = "mid-conversation-system-clear-at-2026-08-21"
+
+    @staticmethod
+    def _multi_turn_messages():
+        """Two consecutive turns: an older clear_at row mid-history plus a
+        new turn's row at the tail, each at its original index."""
+        return [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "turn one"},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "system", "content": "Turn-one guidance.",
+             "clear_at": "next_user_message"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+            ]},
+            {"role": "assistant", "content": "answer two"},
+            {"role": "system", "content": "Turn-two guidance.",
+             "clear_at": "next_user_message"},
+        ]
+
+    def test_consecutive_payloads_preserve_all_clear_at_rows_in_position(self):
+        msgs = self._multi_turn_messages()
+        kwargs = build_anthropic_kwargs(
+            model="claude-fable-5-1",
+            messages=msgs,
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        out = kwargs["messages"]
+        rows = [
+            (i, m) for i, m in enumerate(out)
+            if m.get("role") == "system"
+            and m.get("clear_at") == "next_user_message"
+        ]
+        assert len(rows) == 2, out
+        assert "Turn-one guidance." not in json.dumps(kwargs.get("system", ""))
+        assert out[rows[0][0] - 1]["role"] == "assistant"
+        assert any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in out[rows[0][0] + 1]["content"]
+        )
+        assert rows[1][0] == len(out) - 1
+        assert rows[1][1]["content"] == "Turn-two guidance."
+        betas = kwargs["extra_headers"]["anthropic-beta"].split(",")
+        assert betas.count(self.MID_BETA) == 1
+
+    def test_stable_prefix_ordering_unchanged_across_payloads(self):
+        msgs_a = self._multi_turn_messages()
+        msgs_b = [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "turn one"},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "system", "content": "Turn-one guidance.",
+             "clear_at": "next_user_message"},
+        ]
+        kw_a = build_anthropic_kwargs(
+            model="claude-fable-5-1", messages=msgs_a, tools=None, max_tokens=4096,
+        )
+        kw_b = build_anthropic_kwargs(
+            model="claude-fable-5-1", messages=msgs_b, tools=None, max_tokens=4096,
+        )
+        prefix_len = len(kw_b["messages"])
+        assert kw_a["messages"][:prefix_len] == kw_b["messages"]
+        assert kw_a["system"] == kw_b["system"]
+
+    def test_non_fable_routes_isolate_rows_and_beta(self):
+        for model, base_url in (
+            ("claude-opus-4-7", None),                          # non-Fable native
+            ("claude-fable-5-1", "https://proxy.example.com/anthropic"),  # third-party
+        ):
+            kwargs = build_anthropic_kwargs(
+                model=model,
+                messages=self._multi_turn_messages(),
+                tools=None,
+                max_tokens=4096,
+                base_url=base_url,
+                reasoning_config={"enabled": True, "effort": "high"},
+            )
+            assert "clear_at" not in json.dumps(kwargs.get("messages", [])), model
+            beta_header = (kwargs.get("extra_headers") or {}).get(
+                "anthropic-beta", ""
+            )
+            assert self.MID_BETA not in beta_header, model
+            # The rows must not leak into the stable system prompt either.
+            assert "Turn-one guidance." not in json.dumps(
+                kwargs.get("system", "")
+            ), model
+
+    def test_failover_preserves_clear_at_rows_and_reorders_nothing(self):
+        from agent.conversation_loop import _sync_failover_system_message
+
+        msgs = self._multi_turn_messages()
+        agent = SimpleNamespace(
+            _cached_system_prompt="You are Hermes (failover identity).",
+            ephemeral_system_prompt=None,
+            model="claude-fable-5-1",
+            base_url=None,
+        )
+        before = [dict(m) for m in msgs]
+        returned = _sync_failover_system_message(agent, msgs, "old prompt")
+        assert returned == "You are Hermes (failover identity)."
+        assert msgs[0]["content"] == "You are Hermes (failover identity)."
+        assert msgs[1:] == before[1:]
+
+    def test_signed_thinking_replays_byte_for_byte_on_fable_later_turns(self):
+        signed_old = {"type": "thinking", "thinking": "plan one",
+                      "signature": "sig-old-abc"}
+        signed_redacted_old = {"type": "redacted_thinking", "data": "blob-old"}
+        signed_latest = {"type": "thinking", "thinking": "plan two",
+                         "signature": "sig-latest-xyz"}
+        messages = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": [
+                dict(signed_old), dict(signed_redacted_old),
+                {"type": "tool_use", "id": "t1",
+                 "name": "read_file", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+            ]},
+            {"role": "assistant", "content": [
+                dict(signed_latest), {"type": "text", "text": "done"},
+            ]},
+            {"role": "user", "content": "q2"},
+        ]
+        _sys, out = convert_messages_to_anthropic(
+            messages, base_url=None, model="claude-fable-5-1",
+        )
+        # Older turn's signed thinking + redacted blocks survive verbatim.
+        assert signed_old in out[1]["content"]
+        assert signed_redacted_old in out[1]["content"]
+        # The latest signed block stays in its own assistant turn.
+        assert signed_latest in out[3]["content"]
+
+    def test_assistant_leading_history_keeps_system_row_after_intended_assistant(self):
+        """A compacted (assistant-leading) history gains the synthetic user
+        turn, while the in-stream clear_at system row stays immediately
+        after the assistant turn it scoped — never hoisted to the front."""
+        messages = [
+            {"role": "assistant", "content": "earlier answer"},
+            {"role": "system", "content": "Turn guidance.",
+             "clear_at": "next_user_message"},
+            {"role": "user", "content": "next question"},
+        ]
+        _sys, out = convert_messages_to_anthropic(
+            messages, base_url=None, model="claude-fable-5-1",
+        )
+        assert out[0]["role"] == "user"  # synthetic leading user turn
+        assert out[1]["role"] == "assistant"
+        assert out[1]["content"] == "earlier answer"
+        # The clear_at row remains directly after its intended assistant.
+        assert out[2] == {"role": "system", "content": "Turn guidance.",
+                          "clear_at": "next_user_message"}
+        assert out[3]["role"] == "user"
+
+    def test_consecutive_assistant_merge_invalidates_signatures(self):
+        """Merging consecutive assistant turns must remove every thinking
+        signature on the merged turn — through the production conversion."""
+        messages = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "a", "signature": "sig-a"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "b", "signature": "sig-b"},
+                {"type": "text", "text": "merged"},
+            ]},
+            {"role": "user", "content": "next"},
+        ]
+        _sys, out = convert_messages_to_anthropic(
+            messages, base_url=None, model="claude-fable-5-1",
+        )
+        merged = [m for m in out if m["role"] == "assistant"]
+        assert len(merged) == 1
+        blocks = json.dumps(merged[0]["content"])
+        assert '"sig-a"' not in blocks
+        assert '"sig-b"' not in blocks
+
+    def test_empty_progress_thinking_not_empty_failed_response(self):
+        """Empty/omitted progress thinking on native Fable with a terminal
+        stop must not be classified as an empty failed response."""
+        from agent.conversation_loop import _is_native_fable_terminal_stop
+
+        agent = SimpleNamespace(
+            api_mode="anthropic_messages",
+            model="claude-fable-5-1",
+            base_url=None,
+        )
+        assert _is_native_fable_terminal_stop(agent, "stop") is True
+        agent.model = "claude-opus-4-7"
+        assert _is_native_fable_terminal_stop(agent, "stop") is False
+
+    def test_legacy_ephemeral_whitespace_preserved_exactly(self):
+        from agent.anthropic_adapter import assemble_ephemeral_system_messages
+
+        eph = "  padded turn guidance  \n"
+        lead, trailing = assemble_ephemeral_system_messages(
+            "stable", eph, model="claude-opus-4-7", base_url=None,
+        )
+        assert trailing == []
+        assert lead["content"] == "stable\n\n" + eph
+        # No base — the ephemeral bytes are the entire leading row.
+        lead, trailing = assemble_ephemeral_system_messages(
+            "", eph, model="claude-opus-4-7", base_url=None,
+        )
+        assert lead["content"] == eph
+        # Fable route also keeps its trailing row bytes unstripped.
+        lead, trailing = assemble_ephemeral_system_messages(
+            "stable", eph, model="claude-fable-5-1", base_url=None,
+        )
+        assert trailing[0]["content"] == eph
+
+
 
     def test_non_claude_anthropic_models_use_manual_path(self):
         """Non-Claude Anthropic-Messages models (minimax, qwen3, glm) must not

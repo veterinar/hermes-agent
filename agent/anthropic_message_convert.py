@@ -821,6 +821,12 @@ def _merge_consecutive_roles(result: List[Dict[str, Any]]) -> List[Dict[str, Any
     """
     fixed = []
     for m in result:
+        # In-stream ``clear_at`` system rows (Fable 5.1 mid-conversation
+        # system beta) are opaque to alternation: never merge them into
+        # user/assistant runs, and never merge two of them together.
+        if m.get("role") == "system":
+            fixed.append(m)
+            continue
         if fixed and fixed[-1]["role"] == m["role"]:
             if m["role"] == "user":
                 prev_content = fixed[-1]["content"]
@@ -837,6 +843,14 @@ def _merge_consecutive_roles(result: List[Dict[str, Any]]) -> List[Dict[str, Any
                     fixed[-1]["content"] = prev_content + curr_content
             else:
                 # Consecutive assistant messages — merge text content.
+                # The merge itself mutates the surviving turn's content, so
+                # ANY signed thinking block on either message is now dead:
+                # Anthropic signs thinking against the full turn content.
+                # Mark the surviving message BEFORE _manage_thinking_signatures
+                # so the existing invalidation path demotes/strips the signed
+                # blocks (critical on native Fable 5.1, which otherwise
+                # replays signed blocks byte-for-byte).
+                fixed[-1]["_thinking_signature_invalidated"] = True
                 # Propagate the orphan-strip signature-invalidation flag onto the
                 # surviving (prev) dict so _manage_thinking_signatures still sees it.
                 if m.get("_thinking_signature_invalidated"):
@@ -900,6 +914,15 @@ def _manage_thinking_signatures(
         _is_third_party_anthropic_endpoint(base_url)
         and not _is_nous_portal_endpoint(base_url)
     )
+    # Native Claude Fable 5.1 (direct Anthropic): accepted signed
+    # thinking/redacted-thinking blocks replay byte-for-byte on later turns.
+    # A real provider-visible prefix divergence is handled by state (the
+    # ``_thinking_signature_invalidated`` flag set by orphan-stripping) —
+    # positional age alone must never invalidate a signature.
+    _fable_native = (
+        not _is_third_party
+        and normalize_model_name(model or "").lower() == "claude-fable-5-1"
+    )
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
@@ -927,9 +950,11 @@ def _manage_thinking_signatures(
                     continue
                 new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
-        elif _is_third_party or idx != last_assistant_idx:
+        elif _is_third_party or (idx != last_assistant_idx and not _fable_native):
             # Third-party: strip ALL thinking blocks (signatures are proprietary).
-            # Direct Anthropic: strip from non-latest assistant messages only.
+            # Direct Anthropic: strip from non-latest assistant messages only —
+            # except native Fable 5.1, which keeps accepted signed blocks
+            # byte-for-byte on every later turn.
             stripped = [
                 b for b in m["content"]
                 if not (isinstance(b, dict) and b.get("type") in _THINKING_TYPES)
@@ -1169,6 +1194,18 @@ def convert_messages_to_anthropic(
         content = m.get("content", "")
 
         if role == "system":
+            if m.get("clear_at") == "next_user_message":
+                # Turn-scoped ephemeral system row (Fable 5.1 native route).
+                # Pass it through in-stream instead of extracting it into the
+                # top-level ``system`` param, so role merging and the synthetic
+                # pipeline below preserve its true relative position in the
+                # conversation.  Only stable system rows become the ``system``
+                # field.  Emitted as role "system" — the Fable mid-conversation
+                # system beta's native wire shape; the alternation machinery
+                # treats it as opaque (never merged into user/assistant runs).
+                row: Dict[str, Any] = {"role": "system", "content": content, "clear_at": "next_user_message"}
+                result.append(row)
+                continue
             if isinstance(content, list):
                 # Preserve cache_control markers on content blocks
                 has_cache = any(

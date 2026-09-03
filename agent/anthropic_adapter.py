@@ -631,34 +631,6 @@ def _is_native_fable_5_1(model: str, base_url: str | None) -> bool:
     return normalize_model_name(model).lower() == "claude-fable-5-1"
 
 
-def split_clear_at_system_row(
-    messages: List[Dict],
-) -> Tuple[Optional[Dict], List[Dict]]:
-    """Separate a turn-scoped ``clear_at`` system row from ordinary messages.
-
-    The Fable 5.1 native route scopes ``agent.ephemeral_system_prompt`` to a
-    trailing mid-conversation system row
-    (``{"role": "system", "content": ..., "clear_at": "next_user_message"}``).
-    ``convert_messages_to_anthropic`` extracts *every* system row into the
-    top-level ``system`` param, so the caller must pull this row out before
-    conversion and append it back to the Anthropic ``messages`` list at the
-    same trailing position. Returns ``(row_or_None, remaining_messages)``.
-    """
-    remaining: List[Dict] = []
-    row: Optional[Dict] = None
-    for m in messages:
-        if (
-            row is None
-            and isinstance(m, dict)
-            and m.get("role") == "system"
-            and m.get("clear_at") == "next_user_message"
-        ):
-            row = m
-        else:
-            remaining.append(m)
-    return row, remaining
-
-
 def assemble_ephemeral_system_messages(
     base_system: str,
     ephemeral_system_prompt: str | None,
@@ -684,8 +656,8 @@ def assemble_ephemeral_system_messages(
     trailing row, even when *base_system* is empty.
     """
     base = base_system or ""
-    eph = (ephemeral_system_prompt or "").strip()
-    if not eph:
+    eph_raw = ephemeral_system_prompt or ""
+    if not eph_raw.strip():
         if base:
             return {"role": "system", "content": base}, []
         return None, []
@@ -693,10 +665,13 @@ def assemble_ephemeral_system_messages(
         leading = {"role": "system", "content": base} if base else None
         return leading, [{
             "role": "system",
-            "content": eph,
+            "content": eph_raw,
             "clear_at": "next_user_message",
         }]
-    combined = (base + "\n\n" + eph).strip()
+    # Legacy route: concatenate the ephemeral text byte-for-byte — the
+    # legacy/non-Fable prompt bytes (including leading/trailing whitespace)
+    # must stay exactly as supplied, so no stripping happens here.
+    combined = (base + "\n\n" + eph_raw) if base else eph_raw
     return {"role": "system", "content": combined}, []
 
 
@@ -1036,7 +1011,29 @@ def build_anthropic_kwargs(
     exactly once. Third-party endpoints and other models keep the legacy
     shapes.
     """
-    clear_at_row, messages = split_clear_at_system_row(messages)
+    # Native Fable 5.1 must be decided BEFORE conversion: the converter
+    # preserves in-stream ``clear_at`` system rows, so only the native route
+    # may hand it the original messages. Every other route (non-Fable model
+    # or third-party Anthropic-compatible endpoint) must drop those rows
+    # first — they never reach the payload nor the top-level system prompt.
+    _fable_native = _is_native_fable_5_1(model, base_url)
+    if _fable_native:
+        _has_clear_at = any(
+            isinstance(m, dict)
+            and m.get("role") == "system"
+            and m.get("clear_at") == "next_user_message"
+            for m in messages
+        )
+    else:
+        _has_clear_at = False
+        messages = [
+            m for m in messages
+            if not (
+                isinstance(m, dict)
+                and m.get("role") == "system"
+                and m.get("clear_at") == "next_user_message"
+            )
+        ]
     system, anthropic_messages = convert_messages_to_anthropic(
         messages, base_url=base_url, model=model
     )
@@ -1262,16 +1259,18 @@ def build_anthropic_kwargs(
     # emit extra_headers explicitly (they override the client-level
     # anthropic-beta header), seeded from the common/OAuth betas so the
     # rest of the surface stays identical. No duplicates.
-    _fable_native = _is_native_fable_5_1(model, base_url)
     _fable_betas: list[str] = []
     if _fable_native:
         if kwargs.get("thinking", {}).get("type") == "adaptive":
             _fable_betas.append(_FABLE_THINKING_DISPLAY_BETA)
-        if clear_at_row is not None:
+        # The converter already left every clear_at row in-stream at its
+        # original position — nothing to reinsert. The presence of any such
+        # row enables the mid-conversation beta exactly once.
+        if _has_clear_at:
             _fable_betas.append(_FABLE_MID_CONVERSATION_SYSTEM_BETA)
-            # The turn-scoped system row survives as a trailing
-            # mid-conversation message, not as top-level `system`.
-            kwargs["messages"] = [*anthropic_messages, dict(clear_at_row)]
+    # Non-Fable and third-party routes: the clear_at rows were dropped
+    # before conversion, and neither the beta nor the rows reach the
+    # payload below.
     need_extra_betas = bool(_fable_betas)
 
     if (

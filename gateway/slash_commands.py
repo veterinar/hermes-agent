@@ -2713,6 +2713,7 @@ class GatewaySlashCommandsMixin:
                 truncated,
                 active_only=True,
                 reject_active_turn_lease=True,
+                archive_dropped=True,
             ):
                 return "Retry failed; transcript was not changed."
         # Reset stored token count — transcript was truncated

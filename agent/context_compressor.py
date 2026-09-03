@@ -5269,7 +5269,7 @@ Update the summary using this exact structure. PRESERVE all existing information
             # First compaction: summarize from scratch
             prompt = f"""{_summarizer_preamble}
 
-Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns. Unless clearly obsolete, preserve from the conversation: exact decisions and constraints; exact artifact/run identities (file paths, commit SHAs, issue/PR/run IDs, commands, URLs, versions, counts); unresolved questions and next actions; rejected options and the reasons they were rejected.
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}{_memory_section}

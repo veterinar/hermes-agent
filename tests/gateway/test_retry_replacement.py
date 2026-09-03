@@ -277,6 +277,16 @@ async def test_gateway_retry_replaces_last_user_turn_in_transcript(tmp_path, mon
         "new answer",
     ]
 
+    # The dropped canonical rows must survive the retry as inactive/auditable
+    # rows, not be deleted: /retry passes archive_dropped=True so the replaced
+    # exchange is soft-archived like the composite-carrier rewind path.
+    inactive_rows = [
+        row
+        for row in store._db.get_messages(session_id, include_inactive=True)
+        if not row["active"]
+    ]
+    assert [row["content"] for row in inactive_rows] == ["retry me", "old answer"]
+
 
 @pytest.mark.asyncio
 async def test_gateway_retry_redispatches_live_carrier_text_and_keeps_scaffold(

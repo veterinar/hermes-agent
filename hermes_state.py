@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import atexit
 import contextlib
+import copy
 import errno
 import hashlib
 import json
@@ -11719,6 +11720,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return content
         return content
 
+    # Private display-metadata marker that flags a persisted row as a
+    # turn-scoped ``clear_at: next_user_message`` system row. The row is
+    # stored as a PHYSICAL row (role=system, its own content) so consecutive
+    # and trailing clear-at rows survive verbatim; the marker rides in the
+    # row's display metadata and must survive public display-metadata
+    # replacement, while conversation replay pops it and re-attaches
+    # ``clear_at`` on the message dict — it never leaks out.
+    _CLEAR_AT_CARRIER_KEY = "__hermes_clear_at_system__"
+
+    @classmethod
+    def _normalized_clear_at_marker(cls, meta: Any) -> Optional[str]:
+        """Normalized ``clear_at`` value carried in a row's display metadata."""
+        if not isinstance(meta, dict):
+            return None
+        carrier = meta.get(cls._CLEAR_AT_CARRIER_KEY)
+        if isinstance(carrier, dict) and carrier.get("clear_at"):
+            return carrier["clear_at"]
+        # Legacy folded shape (pre-physical-row): the carrier held the whole
+        # system message dict, which itself carries ``clear_at``.
+        if isinstance(carrier, dict) and carrier.get("role") == "system":
+            return carrier.get("clear_at")
+        return None
+
     @staticmethod
     def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
         """Serialize ``display_metadata`` for its TEXT column without double-encoding.
@@ -12168,17 +12192,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             row = conn.execute(
-                "SELECT id FROM messages WHERE session_id = ? AND role = ? "
+                "SELECT id, display_metadata FROM messages WHERE session_id = ? AND role = ? "
                 "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
                 (session_id, role, self._encode_content(content)),
             ).fetchone()
             if row is None:
                 return False
+            merged_metadata = display_metadata
+            existing_meta = self._decode_display_metadata(row[1])
+            existing_marker = existing_meta.get(self._CLEAR_AT_CARRIER_KEY) if existing_meta else None
+            if existing_marker is not None:
+                # The private clear-at marker is persistence state, not public
+                # presentation metadata — it must survive wholesale public
+                # replacement on its own physical row.
+                merged_metadata = dict(display_metadata or {})
+                merged_metadata[self._CLEAR_AT_CARRIER_KEY] = existing_marker
             conn.execute(
                 "UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
                 (
                     _scrub_surrogates(display_kind),
-                    self._encode_display_metadata(display_metadata),
+                    self._encode_display_metadata(merged_metadata),
                     row[0],
                 ),
             )
@@ -12406,7 +12439,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
+        # Turn-scoped ``clear_at`` system rows are stored as PHYSICAL rows
+        # (role=system with their own content), stamped with a private
+        # display-metadata marker. Consecutive and trailing clear-at rows
+        # therefore persist verbatim (see _rows_to_conversation, which pops
+        # the marker and re-attaches ``clear_at`` on replay). Work on
+        # sanitized copies — the caller's dicts must not be mutated.
+        stored_messages: List[Dict[str, Any]] = []
         for msg in messages:
+            if not isinstance(msg, dict):
+                stored_messages.append(msg)
+                continue
+            if (
+                msg.get("role") == "system"
+                and isinstance(msg.get("clear_at"), str)
+                and msg["clear_at"] == "next_user_message"
+            ):
+                stored = copy.deepcopy(msg)
+                meta = dict(stored.get("display_metadata") or {})
+                meta[self._CLEAR_AT_CARRIER_KEY] = {"clear_at": stored["clear_at"]}
+                stored["display_metadata"] = meta
+                stored_messages.append(stored)
+                continue
+            # A public display-metadata dict could itself smuggle the private
+            # marker in; only the persistence path above may set it.
+            meta = msg.get("display_metadata")
+            if isinstance(meta, dict) and self._CLEAR_AT_CARRIER_KEY in meta:
+                stored = copy.deepcopy(msg)
+                clean_meta = dict(stored.get("display_metadata") or {})
+                clean_meta.pop(self._CLEAR_AT_CARRIER_KEY, None)
+                stored["display_metadata"] = clean_meta or None
+                stored_messages.append(stored)
+                continue
+            stored_messages.append(msg)
+        for msg in stored_messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
             message_timestamp = now_ts
@@ -12546,6 +12612,98 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         active_clause = " AND active = 1" if active_only else ""
 
+        # Detached working copies for insertion — _insert_message_rows stamps
+        # ``_row_id`` onto what it inserts, so it must never see the caller's
+        # dicts. The originals are only touched after a successful commit.
+        messages_to_insert = [copy.deepcopy(m) for m in messages]
+
+        def _stored_logical_sequence(conn):
+            """Provider-visible (stored_row_id, role, content, api_content, clear_at).
+
+            Physical active rows; turn-scoped ``clear_at`` system rows are
+            themselves physical rows and compare with their normalized marker.
+            Legacy folded carriers (pre-physical-row rows whose FOLLOWING row
+            carries the system payload in its display metadata) are
+            re-materialized as their own entries ahead of their host row —
+            the same shape the caller's list has.
+            """
+            rows = conn.execute(
+                "SELECT id, role, content, api_content, display_metadata "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            seq = []
+            for row in rows:
+                meta = self._decode_display_metadata(row["display_metadata"])
+                marker = self._normalized_clear_at_marker(meta)
+                if row["role"] == "system" and marker:
+                    seq.append(
+                        (
+                            row["id"],
+                            "system",
+                            row["content"],
+                            None,
+                            marker,
+                        )
+                    )
+                    continue
+                if meta:
+                    carrier = meta.get(self._CLEAR_AT_CARRIER_KEY)
+                    if isinstance(carrier, dict) and carrier.get("role") == "system":
+                        # Legacy folded shape: the carrier holds the whole
+                        # system message dict on the host row.
+                        seq.append(
+                            (
+                                row["id"],
+                                "system",
+                                self._encode_content(carrier.get("content")),
+                                None,
+                                carrier.get("clear_at") or "next_user_message",
+                            )
+                        )
+                seq.append(
+                    (
+                        row["id"],
+                        row["role"],
+                        row["content"],
+                        row["api_content"],
+                        None,
+                    )
+                )
+            return seq
+
+        def _incoming_logical_sequence():
+            seq = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    seq.append((None, None, None, None, None))
+                    continue
+                if (
+                    msg.get("role") == "system"
+                    and msg.get("clear_at") == "next_user_message"
+                ):
+                    seq.append(
+                        (
+                            None,
+                            "system",
+                            self._encode_content(msg.get("content")),
+                            None,
+                            msg.get("clear_at"),
+                        )
+                    )
+                    continue
+                api = msg.get("api_content")
+                seq.append(
+                    (
+                        None,
+                        msg.get("role"),
+                        self._encode_content(msg.get("content")),
+                        api if api is not None else None,
+                        None,
+                    )
+                )
+            return seq
+
         def _do(conn):
             if reject_active_turn_lease:
                 self._check_transcript_write_guards(
@@ -12566,50 +12724,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and session["end_reason"] == "compression"
                 ):
                     raise CompressionSessionClosedError(session_id)
-            # Divergence sweep (same transaction): compare the current
-            # active rows (ordered by id) with the incoming list by role
-            # plus encoded content. A strict append (stored rows are an
-            # exact prefix of a longer incoming list) is NOT divergence —
-            # the new tail keeps its sidecars. A changed overlapping entry
-            # or a truncation defines the first divergence; from there on,
-            # clear the opaque anthropic_content_blocks sidecar on the
-            # stored active rows and drop it from incoming messages before
-            # reinsertion, so stale replay state is discarded exactly once
-            # while canonical rows are retained (archive_dropped=True).
-            current_rows = conn.execute(
-                "SELECT id, role, content FROM messages "
-                "WHERE session_id = ? AND active = 1 ORDER BY id",
-                (session_id,),
-            ).fetchall()
+            # Divergence sweep: compare the stored provider-visible sequence
+            # (clear_at carriers included) with the incoming list on role,
+            # encoded clean content, and api_content. Unchanged clean content
+            # with a changed api_content IS divergence. A strict append is
+            # not. From the first divergence on, clear the stored opaque
+            # anthropic_content_blocks sidecars and drop them from the
+            # incoming copies before reinsertion.
+            stored_seq = _stored_logical_sequence(conn)
+            incoming_seq = _incoming_logical_sequence()
             divergence = None
-            for idx, row in enumerate(current_rows):
-                if idx >= len(messages):
+            for idx, stored in enumerate(stored_seq):
+                if idx >= len(incoming_seq):
                     divergence = idx  # truncation: incoming drops stored rows
                     break
-                incoming = messages[idx]
+                incoming = incoming_seq[idx]
                 if (
-                    row["role"] != incoming.get("role")
-                    or row["content"] != self._encode_content(incoming.get("content"))
+                    stored[1] != incoming[1]
+                    or stored[2] != incoming[2]
+                    or stored[3] != incoming[3]
+                    or stored[4] != incoming[4]
                 ):
                     divergence = idx
                     break
+            originals_to_strip = []
             if divergence is not None:
-                divergent_ids = [r["id"] for r in current_rows[divergence:]]
-                if divergent_ids:
-                    conn.execute(
-                        "UPDATE messages SET anthropic_content_blocks = NULL "
-                        f"WHERE id IN ({','.join('?' * len(divergent_ids))})",
-                        divergent_ids,
-                    )
-                for stale in messages[divergence:]:
-                    if isinstance(stale, dict):
-                        stale.pop("anthropic_content_blocks", None)
+                first_divergent_id = stored_seq[divergence][0]
+                # Bounded predicate — never a placeholder per transcript row.
+                conn.execute(
+                    "UPDATE messages SET anthropic_content_blocks = NULL "
+                    "WHERE session_id = ? AND active = 1 AND id >= ?",
+                    (session_id, first_divergent_id),
+                )
+                for logical_idx, msg in enumerate(messages):
+                    if logical_idx < divergence:
+                        continue
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        originals_to_strip.append(msg)
+                for logical_idx, msg in enumerate(messages_to_insert):
+                    if logical_idx >= divergence and isinstance(msg, dict):
+                        msg.pop("anthropic_content_blocks", None)
+
+            def _finalize_originals():
+                # Runs ONLY after _execute_write reports a successful commit;
+                # a rolled-back transaction leaves the originals untouched.
+                for original in originals_to_strip:
+                    original.pop("anthropic_content_blocks", None)
+                for original, inserted in zip(messages, messages_to_insert):
+                    if isinstance(original, dict) and isinstance(inserted, dict):
+                        row_id = inserted.get("_row_id")
+                        if row_id is not None:
+                            original["_row_id"] = row_id
+
             if archive_dropped:
-                # Content-preserving UPDATE: the rows keep their FTS entries
-                # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
-                # of content columns, not on `active`), so the replaced turns
-                # stay readable via get_messages(include_inactive=True) and
-                # searchable with include_inactive=True after the rewrite.
                 conn.execute(
                     "UPDATE messages SET active = 0 "
                     "WHERE session_id = ? AND active = 1",
@@ -12625,14 +12792,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages_to_insert
             )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
             )
+            return _finalize_originals
 
-        self._execute_write(_do)
+        finalize = self._execute_write(_do)
+        finalize()
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -13397,7 +13566,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if row["display_metadata"]:
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
-                    msg["display_metadata"] = decoded
+                    # Turn-scoped ``clear_at`` system rows are PHYSICAL rows.
+                    # On replay, pop the private marker, re-attach
+                    # ``clear_at`` on the message dict, and pass the
+                    # remaining display metadata through (never leaking the
+                    # private key). Legacy folded carriers (stored on the
+                    # host row before physical persistence) are
+                    # re-materialized as an exact deep copy immediately
+                    # before this message instead.
+                    carrier = decoded.pop(self._CLEAR_AT_CARRIER_KEY, None)
+                    if (
+                        carrier is not None
+                        and isinstance(carrier, dict)
+                        and carrier.get("role") == "system"
+                    ):
+                        messages.append(copy.deepcopy(carrier))
+                    elif row["role"] == "system" and carrier is not None:
+                        clear_at = self._normalized_clear_at_marker(
+                            {self._CLEAR_AT_CARRIER_KEY: carrier}
+                        )
+                        if clear_at:
+                            msg["clear_at"] = clear_at
+                    if decoded:
+                        msg["display_metadata"] = decoded
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             if row["timestamp"]:

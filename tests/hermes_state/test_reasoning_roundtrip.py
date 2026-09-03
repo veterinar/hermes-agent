@@ -8,6 +8,9 @@ get_messages() into replace_messages() — must not re-encode that TEXT,
 or the forked session replays with reasoning fields decoding to strings
 and every isinstance(..., list) consumer silently drops them.
 """
+import copy
+import sqlite3
+
 import pytest
 
 from hermes_state import SessionDB
@@ -254,4 +257,255 @@ class TestAnthropicDivergenceClearing:
         assert assistants[0]["anthropic_content_blocks"] == ANTHROPIC_CONTENT_BLOCKS
         assert assistants[1]["anthropic_content_blocks"] == [
             {"type": "text", "text": "appended blocks"}
+        ]
+
+    def test_strict_append_with_api_content_prefix_keeps_sidecars(self, db):
+        # AC-STATE-6: an identical provider-visible prefix (content AND
+        # api_content) is a strict append — existing and new sidecars live.
+        db.create_session("src", source="cli")
+        db.append_message("src", role="user", content="hi")
+        db.append_message(
+            "src",
+            role="assistant",
+            content="done",
+            api_content="done (provider bytes)",
+            anthropic_content_blocks=ANTHROPIC_CONTENT_BLOCKS,
+        )
+        rows = db.get_messages("src")
+        grown = list(rows) + [
+            {"role": "user", "content": "more"},
+            {
+                "role": "assistant",
+                "content": "more done",
+                "anthropic_content_blocks": [
+                    {"type": "text", "text": "appended blocks"}
+                ],
+            },
+        ]
+        db.replace_messages("src", grown, archive_dropped=True)
+        conv = db.get_messages_as_conversation("src")
+        assistants = [m for m in conv if m["role"] == "assistant"]
+        assert assistants[0]["anthropic_content_blocks"] == ANTHROPIC_CONTENT_BLOCKS
+        assert assistants[1]["anthropic_content_blocks"] == [
+            {"type": "text", "text": "appended blocks"}
+        ]
+
+
+class TestApiContentDivergence:
+    """AC-STATE-3: clean content match + changed api_content IS divergence."""
+
+    def test_api_content_only_change_invalidates_dependent_sidecars(self, db):
+        db.create_session("src", source="cli")
+        db.append_message("src", role="user", content="hi")
+        db.append_message(
+            "src",
+            role="assistant",
+            content="done",
+            api_content="original provider bytes",
+            anthropic_content_blocks=ANTHROPIC_CONTENT_BLOCKS,
+        )
+        rows = db.get_messages("src")
+        # Same clean content, DIFFERENT provider-visible api_content.
+        edited = [dict(m) for m in rows]
+        edited[1]["api_content"] = "rewritten provider bytes"
+        db.replace_messages("src", edited, archive_dropped=True)
+        conv = db.get_messages_as_conversation("src")
+        assistant = _assistant(conv)
+        assert "anthropic_content_blocks" not in assistant
+        # Caller's dict stripped too.
+        assert "anthropic_content_blocks" not in edited[1]
+        # The persisted (archived) original row lost its sidecar as well.
+        for r in db.get_messages("src", include_inactive=True):
+            assert r.get("anthropic_content_blocks") is None
+
+    def test_api_content_absence_normalized_consistently(self, db):
+        # Stored row without api_content vs incoming dict without the key:
+        # not divergence — sidecar survives an in-place rewrite whose
+        # divergence sweep runs against the populated session.
+        rows = _seed_anthropic(db)
+        edited = [dict(m) for m in rows]
+        edited[1].pop("api_content", None)
+        db.replace_messages("src", edited)
+        assert (
+            _assistant(db.get_messages_as_conversation("src"))[
+                "anthropic_content_blocks"
+            ]
+            == ANTHROPIC_CONTENT_BLOCKS
+        )
+
+
+class TestBoundedInvalidationShape:
+    """AC-STATE-4: the clearing SQL is constant-size, not per-row placeholders."""
+
+    def test_bounded_update_uses_two_bind_values(self, db, monkeypatch):
+        # Capture the clearing UPDATE's bound parameters on the real write
+        # connection: it must carry exactly (session_id, first_divergent_id)
+        # regardless of transcript length — the bounded form, never an
+        # IN list with a placeholder per row.
+        real_conn = db._conn
+        captured = []
+
+        def _trace(sql, params=()):
+            if "anthropic_content_blocks = NULL" in sql:
+                captured.append(tuple(params))
+            return real_trace(sql, params)
+
+        real_trace = real_conn.execute
+        monkeypatch.setattr(real_conn, "execute", _trace)
+
+        db.create_session("src", source="cli")
+        # Long enough that a per-row placeholder form would need many binds.
+        for i in range(20):
+            db.append_message("src", role="user", content=f"q{i}")
+            db.append_message(
+                "src",
+                role="assistant",
+                content=f"a{i}",
+                anthropic_content_blocks=[{"type": "text", "text": f"blocks {i}"}],
+            )
+        monkeypatch.undo()
+        rows = db.get_messages("src")
+        edited = [dict(m) for m in rows]
+        edited[0]["content"] = "q0 (edited)"
+        monkeypatch.setattr(real_conn, "execute", _trace)
+        try:
+            db.replace_messages("src", edited)
+        finally:
+            monkeypatch.undo()
+        assert captured == [(("src"), (rows[0]["id"]))]
+
+
+class TestRollbackMutationSafety:
+    """AC-STATE-5: a failed transaction leaves caller dicts deep-equal."""
+
+    def test_failed_write_leaves_inputs_untouched(self, db, monkeypatch):
+        rows = _seed_anthropic(db)
+        edited = [dict(m) for m in rows]
+        edited[0]["content"] = "hi (edited)"
+        before = copy.deepcopy(edited)
+
+        def _boom(conn, session_id, messages):
+            raise sqlite3.OperationalError("injected write failure")
+
+        monkeypatch.setattr(db, "_insert_message_rows", _boom)
+        with pytest.raises(sqlite3.OperationalError):
+            db.replace_messages("src", edited, archive_dropped=True)
+        assert edited == before
+        # Stored rows untouched — the old sidecar is still there.
+        assert (
+            _assistant(db.get_messages_as_conversation("src"))[
+                "anthropic_content_blocks"
+            ]
+            == ANTHROPIC_CONTENT_BLOCKS
+        )
+
+
+def _clear_at_system(text):
+    return {
+        "role": "system",
+        "content": text,
+        "clear_at": "next_user_message",
+    }
+
+
+def _seed_clear_at_pair(db, sid="src"):
+    """U1,S1,A1,U2,S2,A2 with two distinct clear_at system rows."""
+    db.create_session(sid, source="cli")
+    transcript = [
+        {"role": "user", "content": "u1"},
+        _clear_at_system("system one"),
+        {
+            "role": "assistant",
+            "content": "a1",
+            "display_metadata": {"unrelated": {"k": [1, 2]}},
+            "anthropic_content_blocks": [{"type": "text", "text": "a1 blocks"}],
+        },
+        {"role": "user", "content": "u2"},
+        _clear_at_system("system two"),
+        {
+            "role": "assistant",
+            "content": "a2",
+            "display_metadata": {"other": "meta"},
+        },
+    ]
+    db.replace_messages(sid, transcript)
+    return transcript
+
+
+class TestClearAtSystemRows:
+    """AC-STATE-1/2: folded clear_at system rows survive every round trip."""
+
+    def test_replay_after_replace_returns_exact_rows_in_order(self, db):
+        transcript = _seed_clear_at_pair(db)
+        conv = db.get_messages_as_conversation("src")
+        assert [m["role"] for m in conv] == [
+            "user",
+            "system",
+            "assistant",
+            "user",
+            "system",
+            "assistant",
+        ]
+        # Exact dict bytes for the system rows (minus internal markers).
+        for original, replayed in zip(transcript, conv):
+            if original["role"] != "system":
+                continue
+            cleaned = {
+                k: v
+                for k, v in replayed.items()
+                if not k.startswith("_")
+            }
+            assert cleaned == original
+        # No private carrier key leaks into any display metadata.
+        for m in conv:
+            meta = m.get("display_metadata") or {}
+            assert "__hermes_clear_at_system__" not in meta
+
+    def test_survive_close_and_reopen_at_exact_positions(self, db, tmp_path):
+        _seed_clear_at_pair(db)
+        db.close()
+        db2 = SessionDB(tmp_path / "state.db")
+        try:
+            conv = db2.get_messages_as_conversation("src")
+            assert [m["role"] for m in conv] == [
+                "user",
+                "system",
+                "assistant",
+                "user",
+                "system",
+                "assistant",
+            ]
+            assert conv[1]["content"] == "system one"
+            assert conv[4]["content"] == "system two"
+            for m in conv:
+                meta = m.get("display_metadata") or {}
+                assert "__hermes_clear_at_system__" not in meta
+        finally:
+            db2.close()
+
+    def test_survive_replace_fork_roundtrip_with_metadata(self, db):
+        _seed_clear_at_pair(db)
+        conv = db.get_messages_as_conversation("src")
+        # Fork: replayed conversation straight back through replace.
+        db.create_session("fork", source="cli")
+        db.replace_messages("fork", [dict(m) for m in conv])
+        forked = db.get_messages_as_conversation("fork")
+        assert [m["role"] for m in forked] == [m["role"] for m in conv]
+        assert forked[1]["content"] == "system one"
+        assert forked[4]["content"] == "system two"
+        # Unrelated assistant display metadata preserved through the fork.
+        assert forked[2]["display_metadata"] == {"unrelated": {"k": [1, 2]}}
+        assert forked[5]["display_metadata"] == {"other": "meta"}
+        for m in forked:
+            meta = m.get("display_metadata") or {}
+            assert "__hermes_clear_at_system__" not in meta
+
+    def test_no_physical_system_row_in_database(self, db):
+        _seed_clear_at_pair(db)
+        rows = db.get_messages("src")
+        assert [r["role"] for r in rows] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
         ]

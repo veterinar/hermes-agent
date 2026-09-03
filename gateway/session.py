@@ -4319,6 +4319,7 @@ class SessionStore:
         messages: List[Dict[str, Any]],
         active_only: bool = False,
         reject_active_turn_lease: bool = False,
+        archive_dropped: bool = False,
     ) -> bool:
         """Replace the entire transcript for a session with new messages.
 
@@ -4353,6 +4354,7 @@ class SessionStore:
                     messages,
                     active_only=active_only,
                     reject_active_turn_lease=reject_active_turn_lease,
+                    archive_dropped=archive_dropped,
                 )
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
