@@ -116,3 +116,142 @@ class TestAppendMessageRoundTrip:
         )
         msg = _assistant(db.get_messages_as_conversation("copy"))
         assert msg["reasoning_details"] == REASONING_DETAILS
+
+
+ANTHROPIC_CONTENT_BLOCKS = [
+    {"type": "text", "text": "part one"},
+    {"type": "thinking", "thinking": "hmm", "signature": "sig-1"},
+    {"type": "text", "text": "part two"},
+]
+
+
+def _seed_anthropic(db, sid="src"):
+    db.create_session(sid, source="cli")
+    db.append_message(sid, role="user", content="hi")
+    db.append_message(
+        sid,
+        role="assistant",
+        content="done",
+        anthropic_content_blocks=ANTHROPIC_CONTENT_BLOCKS,
+    )
+    return db.get_messages(sid)
+
+
+class TestAnthropicContentBlocks:
+    """Ordered interleaved Anthropic blocks survive every round-trip."""
+
+    def test_blocks_survive_append_and_conversation(self, db):
+        _seed_anthropic(db)
+        msg = _assistant(db.get_messages_as_conversation("src"))
+        assert msg["anthropic_content_blocks"] == ANTHROPIC_CONTENT_BLOCKS
+
+    def test_blocks_survive_replace_roundtrip(self, db):
+        rows = _seed_anthropic(db)
+        db.create_session("fork", source="cli")
+        db.replace_messages("fork", rows)
+        msg = _assistant(db.get_messages_as_conversation("fork"))
+        assert msg["anthropic_content_blocks"] == ANTHROPIC_CONTENT_BLOCKS
+
+    def test_blocks_survive_close_and_reopen(self, db, tmp_path):
+        _seed_anthropic(db)
+        db.close()
+        db2 = SessionDB(tmp_path / "state.db")
+        try:
+            msg = _assistant(db2.get_messages_as_conversation("src"))
+            assert msg["anthropic_content_blocks"] == ANTHROPIC_CONTENT_BLOCKS
+        finally:
+            db2.close()
+
+    def test_non_assistant_sidecar_not_stored(self, db):
+        db.create_session("u", source="cli")
+        db.append_message(
+            "u",
+            role="user",
+            content="hi",
+            anthropic_content_blocks=ANTHROPIC_CONTENT_BLOCKS,
+        )
+        msgs = db.get_messages_as_conversation("u")
+        assert "anthropic_content_blocks" not in msgs[0]
+
+    def test_legacy_column_reconciled_and_readable(self, db, tmp_path):
+        _seed_anthropic(db)
+        db.close()
+        import sqlite3
+
+        con = sqlite3.connect(tmp_path / "state.db")
+        con.execute("ALTER TABLE messages DROP COLUMN anthropic_content_blocks")
+        con.commit()
+        con.close()
+        db2 = SessionDB(tmp_path / "state.db")
+        try:
+            msgs = db2.get_messages_as_conversation("src")
+            # Column is reconciled back; rows read with no sidecar.
+            assert [m["role"] for m in msgs] == ["user", "assistant"]
+            assert "anthropic_content_blocks" not in _assistant(msgs)
+        finally:
+            db2.close()
+
+
+class TestAnthropicDivergenceClearing:
+    """Prefix edits/truncations clear opaque sidecars once, canonically."""
+
+    def test_prefix_edit_clears_sidecars_and_keeps_archive(self, db, tmp_path):
+        rows = _seed_anthropic(db)
+        # Edit the user turn (first message) and append a new assistant turn.
+        edited = [dict(m) for m in rows]
+        edited[0]["content"] = "hi (edited)"
+        edited.append(
+            {
+                "role": "assistant",
+                "content": "fresh",
+                "anthropic_content_blocks": [
+                    {"type": "text", "text": "fresh blocks"}
+                ],
+            }
+        )
+        db.replace_messages("src", edited, archive_dropped=True)
+
+        all_rows = db.get_messages("src", include_inactive=True)
+        # Old canonical rows retained as inactive with old ids.
+        inactive = [r for r in all_rows if not r.get("active", 1)]
+        active = [r for r in all_rows if r.get("active", 1)]
+        assert len(inactive) == 2
+        assert [r["id"] for r in inactive] == [r["id"] for r in rows]
+        assert len(active) == 3
+        # Sidecars cleared on both old (archived) and new dependent rows.
+        for r in all_rows:
+            assert r.get("anthropic_content_blocks") is None
+
+        # Idempotent reopen: no further clearing, no added rows.
+        db.close()
+        db2 = SessionDB(tmp_path / "state.db")
+        try:
+            again = db2.get_messages("src", include_inactive=True)
+            assert len(again) == len(all_rows)
+            for r in again:
+                assert r.get("anthropic_content_blocks") is None
+        finally:
+            db2.close()
+
+    def test_strict_append_keeps_new_sidecars(self, db):
+        rows = _seed_anthropic(db)
+        grown = list(rows) + [
+            {
+                "role": "user",
+                "content": "more",
+            },
+            {
+                "role": "assistant",
+                "content": "more done",
+                "anthropic_content_blocks": [
+                    {"type": "text", "text": "appended blocks"}
+                ],
+            },
+        ]
+        db.replace_messages("src", grown, archive_dropped=True)
+        conv = db.get_messages_as_conversation("src")
+        assistants = [m for m in conv if m["role"] == "assistant"]
+        assert assistants[0]["anthropic_content_blocks"] == ANTHROPIC_CONTENT_BLOCKS
+        assert assistants[1]["anthropic_content_blocks"] == [
+            {"type": "text", "text": "appended blocks"}
+        ]

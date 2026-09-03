@@ -11919,6 +11919,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        anthropic_content_blocks: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
@@ -11958,6 +11959,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reasoning_details_json = self._reasoning_json_text(reasoning_details)
         codex_items_json = self._reasoning_json_text(codex_reasoning_items)
         codex_message_items_json = self._reasoning_json_text(codex_message_items)
+        anthropic_content_blocks_json = (
+            self._reasoning_json_text(anthropic_content_blocks)
+            if role == "assistant"
+            else None
+        )
         # tool_calls may arrive as a Python list (from the live agent) or
         # as a JSON string (from import/export). Parse first to avoid
         # double-encoding.
@@ -11998,8 +12004,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, anthropic_content_blocks, platform_message_id, observed,
+                   _compressed_summary, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -12016,6 +12023,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    anthropic_content_blocks_json,
                     platform_message_id,
                     1 if observed else 0,
                     1 if _compressed_summary else 0,
@@ -12418,9 +12426,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             codex_message_items = (
                 msg.get("codex_message_items") if role == "assistant" else None
             )
+            anthropic_content_blocks = (
+                msg.get("anthropic_content_blocks") if role == "assistant" else None
+            )
             reasoning_details_json = self._reasoning_json_text(reasoning_details)
             codex_items_json = self._reasoning_json_text(codex_reasoning_items)
             codex_message_items_json = self._reasoning_json_text(codex_message_items)
+            anthropic_content_blocks_json = self._reasoning_json_text(
+                anthropic_content_blocks
+            )
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
             # which store it as TEXT). json.dumps on an already-serialized
@@ -12443,8 +12457,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, anthropic_content_blocks, platform_message_id, observed,
+                   _compressed_summary, active, api_content, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -12461,6 +12476,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    anthropic_content_blocks_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1 if msg.get("_compressed_summary") else 0,
@@ -12550,6 +12566,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and session["end_reason"] == "compression"
                 ):
                     raise CompressionSessionClosedError(session_id)
+            # Divergence sweep (same transaction): compare the current
+            # active rows (ordered by id) with the incoming list by role
+            # plus encoded content. A strict append (stored rows are an
+            # exact prefix of a longer incoming list) is NOT divergence —
+            # the new tail keeps its sidecars. A changed overlapping entry
+            # or a truncation defines the first divergence; from there on,
+            # clear the opaque anthropic_content_blocks sidecar on the
+            # stored active rows and drop it from incoming messages before
+            # reinsertion, so stale replay state is discarded exactly once
+            # while canonical rows are retained (archive_dropped=True).
+            current_rows = conn.execute(
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            divergence = None
+            for idx, row in enumerate(current_rows):
+                if idx >= len(messages):
+                    divergence = idx  # truncation: incoming drops stored rows
+                    break
+                incoming = messages[idx]
+                if (
+                    row["role"] != incoming.get("role")
+                    or row["content"] != self._encode_content(incoming.get("content"))
+                ):
+                    divergence = idx
+                    break
+            if divergence is not None:
+                divergent_ids = [r["id"] for r in current_rows[divergence:]]
+                if divergent_ids:
+                    conn.execute(
+                        "UPDATE messages SET anthropic_content_blocks = NULL "
+                        f"WHERE id IN ({','.join('?' * len(divergent_ids))})",
+                        divergent_ids,
+                    )
+                for stale in messages[divergence:]:
+                    if isinstance(stale, dict):
+                        stale.pop("anthropic_content_blocks", None)
             if archive_dropped:
                 # Content-preserving UPDATE: the rows keep their FTS entries
                 # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
@@ -13276,7 +13330,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
-        "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
+        "codex_reasoning_items, codex_message_items, anthropic_content_blocks, "
+        "platform_message_id, observed, "
         "_compressed_summary, timestamp, "
         "api_content, display_kind, display_metadata"
     )
@@ -13396,6 +13451,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+                if row["anthropic_content_blocks"]:
+                    try:
+                        # Ordered sidecar: restore the list exactly as stored —
+                        # never sort, the block order is wire-significant.
+                        msg["anthropic_content_blocks"] = json.loads(
+                            row["anthropic_content_blocks"]
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to deserialize anthropic_content_blocks, omitting"
+                        )
             if include_ancestors:
                 canonical_content, _is_composite = (
                     self._canonical_replayed_user_content(msg)
