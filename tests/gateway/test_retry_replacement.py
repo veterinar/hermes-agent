@@ -277,6 +277,16 @@ async def test_gateway_retry_replaces_last_user_turn_in_transcript(tmp_path, mon
         "new answer",
     ]
 
+    # The dropped canonical rows must survive the retry as inactive/auditable
+    # rows, not be deleted: /retry passes archive_dropped=True so the replaced
+    # exchange is soft-archived like the composite-carrier rewind path.
+    inactive_rows = [
+        row
+        for row in store._db.get_messages(session_id, include_inactive=True)
+        if not row["active"]
+    ]
+    assert [row["content"] for row in inactive_rows] == ["retry me", "old answer"]
+
 
 @pytest.mark.asyncio
 async def test_gateway_retry_redispatches_live_carrier_text_and_keeps_scaffold(
@@ -566,16 +576,27 @@ async def test_gateway_retry_preserves_archived_compaction_rows_when_probe_fails
 
     assert result == "new answer"
     archived_probe.assert_not_called()
-    # The archived pre-compaction rows survive the rewrite untouched.
-    archived = [
+    # Two distinct inactive groups must survive: the pre-existing archived
+    # pre-compaction rows (untouched by the retry) AND the removed live
+    # suffix, which /retry soft-archives for audit (archive_dropped=True).
+    inactive = [
         m for m in store._db.get_messages(session_id, include_inactive=True)
         if not m["active"]
     ]
+    # Pre-existing in-place compaction archive: compacted == 1.
+    archived = [m for m in inactive if m["compacted"] == 1]
     assert [(m["role"], m["content"]) for m in archived] == [
         ("user", "old question"),
         ("assistant", "old answer"),
     ]
     assert all(m["compacted"] == 1 for m in archived)
+    # Dropped live suffix removed by the retry: compacted == 0.
+    dropped = [m for m in inactive if m["compacted"] == 0]
+    assert [(m["role"], m["content"]) for m in dropped] == [
+        ("user", "retry me"),
+        ("assistant", "old answer"),
+    ]
+    assert all(m["compacted"] == 0 for m in dropped)
     # The live set reflects the truncation plus the retried exchange.
     transcript_after = store.load_transcript(session_id)
     assert [m.get("content") for m in transcript_after if m.get("role") == "user"] == [

@@ -5198,27 +5198,38 @@ Be specific with file paths, commands, line numbers, and results.]
 - Modified/created files with brief note on each
 - Test status (X/Y passing)
 - Any running processes or servers
-- Environment details that matter]
+- Environment details that matter
+Preserve exact artifact/run identities: file paths, commit SHAs, issue/PR/run
+IDs, commands, URLs, versions, and counts.]
 
 ## Blocked
 [Any blockers, errors, or issues not yet resolved. Include exact error messages.]
 
 ## Key Decisions
-[Important technical decisions and WHY they were made]
+[Important technical decisions and WHY they were made. Preserve decisions and
+constraints EXACTLY as stated — do not paraphrase or soften them.]
 
 ## Errors & Fixes
 [Errors hit during the compacted turns and how each was resolved — include the
 exact error text. Pay special attention to corrections the USER gave; quote
 the user's correction and record what changed as a result.]
 
+## Rejected Options
+[Options that were considered and rejected, together with the exact reason each
+was rejected. Omit the section only if none occurred.]
+
 ## Resolved Questions
 {_resolved_questions_instructions}
+
+## Unresolved / Next Actions
+[Unresolved questions that still need an answer, and concrete next actions to
+take. Preserve both exactly; do not drop an item just because it is old.]
 
 ## Relevant Files
 [Files read, modified, or created — with brief note on each]
 
 ## Critical Context
-[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]{_session_log_section}
+[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. Preserve exact artifact/run identities — file paths, commit SHAs, issue/PR/run IDs, commands, URLs, versions, and counts. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]{_session_log_section}
 
 {_PRUNED_SKILLS_SECTION_HEADING}
 [If any [SKILL_PRUNED: ...reload with skill_view(...)] markers appear in the input,
@@ -5251,14 +5262,14 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. Unless clearly obsolete, preserve from the previous summary: exact decisions and constraints; exact artifact/run identities (file paths, commit SHAs, issue/PR/run IDs, commands, URLs, versions, counts); unresolved questions and next actions; rejected options and the reasons they were rejected. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
         else:
             # First compaction: summarize from scratch
             prompt = f"""{_summarizer_preamble}
 
-Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns. Unless clearly obsolete, preserve from the conversation: exact decisions and constraints; exact artifact/run identities (file paths, commit SHAs, issue/PR/run IDs, commands, URLs, versions, counts); unresolved questions and next actions; rejected options and the reasons they were rejected.
 
 TURNS TO SUMMARIZE:
 {content_to_summarize}{_memory_section}
@@ -7051,7 +7062,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             "ongoing conversation.  You are given a running summary and the "
             "next exchange from the conversation.  Merge the exchange's key "
             "decisions, requirements, file paths, and open questions into the "
-            "summary.  Preserve the summary's structure.  Drop resolved details "
+            "summary.  Unless clearly obsolete, preserve from the running "
+            "summary: exact decisions and constraints; exact artifact/run "
+            "identities (file paths, commit SHAs, issue/PR/run IDs, commands, "
+            "URLs, versions, counts); unresolved questions and next actions; "
+            "rejected options and the reasons they were rejected.  Preserve "
+            "the summary's structure.  Drop resolved details "
             "that are no longer relevant.  Add new decisions, file paths, and "
             "open questions.\n\n"
             "NEVER include API keys, tokens, passwords, secrets, credentials, "

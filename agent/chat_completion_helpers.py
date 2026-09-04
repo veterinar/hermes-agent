@@ -3149,11 +3149,26 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
         effective_system = agent._cached_system_prompt or ""
         if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
+            from agent.anthropic_adapter import assemble_ephemeral_system_messages
+
+            _lead_sys, _trailing_sys = assemble_ephemeral_system_messages(
+                effective_system,
+                agent.ephemeral_system_prompt,
+                model=getattr(agent, "model", ""),
+                base_url=getattr(agent, "base_url", None),
+            )
+        else:
+            _lead_sys = (
+                {"role": "system", "content": effective_system}
+                if effective_system else None
+            )
+            _trailing_sys = []
+        if _lead_sys is not None:
+            api_messages = [_lead_sys, *api_messages]
+        if _trailing_sys:
+            api_messages = [*api_messages, *_trailing_sys]
         if agent.prefill_messages:
-            sys_offset = 1 if effective_system else 0
+            sys_offset = 1 if _lead_sys is not None else 0
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 

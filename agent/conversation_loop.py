@@ -1659,6 +1659,20 @@ def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool
     return False
 
 
+def _is_native_fable_terminal_stop(agent, finish_reason) -> bool:
+    """True when a native Claude Fable 5.1 anthropic_messages response ended
+    with a valid terminal stop — its empty/omitted progress thinking
+    (``display="updates"``) is legitimate, not an empty failed response."""
+    if finish_reason != "stop" or getattr(agent, "api_mode", None) != "anthropic_messages":
+        return False
+    from agent.anthropic_adapter import _is_native_fable_5_1
+
+    return _is_native_fable_5_1(
+        getattr(agent, "model", ""),
+        getattr(agent, "base_url", None),
+    )
+
+
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     """Refresh the in-flight system message after a provider failover.
 
@@ -1677,12 +1691,70 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
-    if api_messages and api_messages[0].get("role") == "system":
-        effective = sp
-        if agent.ephemeral_system_prompt:
-            effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if not _rewrite_system_content_blocks(api_messages[0], effective):
-            api_messages[0]["content"] = effective
+    # Failover may land on a different wire shape than the one that built
+    # the current call block's ``api_messages``. Re-assemble the system rows
+    # from the shared seam using the POST-failover model/base URL so the
+    # request matches the provider that will actually receive it:
+    #  - native Claude Fable 5.1 keeps the turn-scoped ``clear_at`` layout
+    #    (historical rows preserved in place, current trailing row added
+    #    at most once);
+    #  - every legacy/non-Fable route drops any ``clear_at`` rows and ships
+    #    a single combined leading system row with the exact whitespace the
+    #    seam produced.
+    from agent.anthropic_adapter import (
+        _is_native_fable_5_1,
+        assemble_ephemeral_system_messages,
+    )
+
+    _model = getattr(agent, "model", "")
+    _base_url = getattr(agent, "base_url", None)
+
+    def _is_clear_at_row(m) -> bool:
+        return (
+            isinstance(m, dict)
+            and m.get("role") == "system"
+            and m.get("clear_at") == "next_user_message"
+        )
+
+    _leading, _trailing = assemble_ephemeral_system_messages(
+        sp,
+        getattr(agent, "ephemeral_system_prompt", None),
+        model=_model,
+        base_url=_base_url,
+    )
+
+    def _apply_leading() -> None:
+        if api_messages and api_messages[0].get("role") == "system":
+            if _leading is not None:
+                if not _rewrite_system_content_blocks(api_messages[0], _leading["content"]):
+                    api_messages[0]["content"] = _leading["content"]
+            else:
+                api_messages.pop(0)
+        elif _leading is not None:
+            api_messages.insert(0, _leading)
+
+    if _is_native_fable_5_1(_model, _base_url):
+        # Rewrite ONLY the leading stable system row; historical
+        # ``clear_at`` rows keep their positions — removing/reordering
+        # them would break the Fable mid-conversation wire contract.
+        _apply_leading()
+        if _trailing:
+            _row = _trailing[0]
+            _tail = api_messages[-1] if api_messages else None
+            if not (
+                _is_clear_at_row(_tail)
+                and _tail.get("content") == _row.get("content")
+            ):
+                api_messages.append(dict(_row))
+        return sp
+
+    # Legacy/non-Fable wire shape: ``clear_at`` rows are Fable-only and
+    # must not survive a failover onto a route that doesn't understand
+    # them. The seam already returned the exact-whitespace combined
+    # legacy leading row.
+    if any(_is_clear_at_row(m) for m in api_messages):
+        api_messages[:] = [m for m in api_messages if not _is_clear_at_row(m)]
+    _apply_leading()
     return sp
 
 
@@ -2557,9 +2629,24 @@ def run_conversation(
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        if effective_system:
-            api_messages = [{"role": "system", "content": effective_system}] + api_messages
+            from agent.anthropic_adapter import assemble_ephemeral_system_messages
+
+            _lead_sys, _trailing_sys = assemble_ephemeral_system_messages(
+                effective_system,
+                agent.ephemeral_system_prompt,
+                model=getattr(agent, "model", ""),
+                base_url=getattr(agent, "base_url", None),
+            )
+        else:
+            _lead_sys = (
+                {"role": "system", "content": effective_system}
+                if effective_system else None
+            )
+            _trailing_sys = []
+        if _lead_sys is not None:
+            api_messages = [_lead_sys, *api_messages]
+        if _trailing_sys:
+            api_messages = [*api_messages, *_trailing_sys]
 
         if moa_config:
             try:
@@ -8215,6 +8302,23 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    # ── Native Fable terminal stop ───────────────────
+                    # A native Claude Fable 5.1 response with a valid
+                    # terminal stop is a COMPLETED turn even when its
+                    # visible content is empty (progress-only thinking
+                    # under ``display="updates"`` legitimately yields no
+                    # text). Exit successfully here — before the nudge,
+                    # prefill, retry, and fallback recovery machinery,
+                    # and without appending any ``(empty)`` sentinel.
+                    if _is_native_fable_terminal_stop(agent, finish_reason):
+                        _turn_exit_reason = "native_fable_terminal_stop"
+                        logger.info(
+                            "Native Fable terminal stop with empty progress "
+                            "thinking — treating as successful turn end"
+                        )
+                        agent._response_was_previewed = False
+                        break
+
                     if (
                         _prior_was_tool
                         and not getattr(agent, "_post_tool_empty_retried", False)
@@ -8295,6 +8399,17 @@ def run_conversation(
                     _truly_empty = not agent._strip_think_blocks(
                         final_response
                     ).strip()
+                    # ── Native Fable 5.1 empty-progress guard ─────────
+                    # With ``thinking.display="updates"`` the progress
+                    # thinking legitimately comes back empty or omitted.
+                    # A response with a valid terminal stop (or surviving
+                    # text/tool blocks — already covered by
+                    # ``_truly_empty`` being False) is NOT an empty failed
+                    # response; classifying it as one burns a paid retry.
+                    if _truly_empty and _is_native_fable_terminal_stop(
+                        agent, finish_reason
+                    ):
+                        _truly_empty = False
                     _prefill_exhausted = (
                         _has_structured
                         and agent._thinking_prefill_retries >= 2

@@ -87,6 +87,42 @@ def test_no_focus_topic_no_injection():
     assert "FOCUS TOPIC" not in prompt_text
 
 
+def test_compaction_prompts_preserve_continuity_state():
+    """Batch and micro prompts both preserve Fable 5.1 continuity state."""
+    compressor = _make_compressor()
+    turns = [
+        {"role": "user", "content": "Fix the login bug"},
+        {"role": "assistant", "content": "Working on it."},
+    ]
+
+    captured_prompt = {}
+
+    def mock_call_llm(**kwargs):
+        captured_prompt["messages"] = kwargs["messages"]
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = "## Goal\nFix login bug."
+        return resp
+
+    with patch("agent.context_compressor.call_llm", mock_call_llm):
+        compressor._generate_summary(turns)
+
+    batch_prompt = captured_prompt["messages"][0]["content"]
+    assert "## Unresolved / Next Actions" in batch_prompt
+    assert "## Rejected Options" in batch_prompt
+
+    micro_messages = compressor._build_micro_summary_prompt(
+        "Existing summary.", "user: hi\nassistant: hello"
+    )
+    micro_prompt = micro_messages[1]["content"]
+
+    for prompt in (batch_prompt, micro_prompt):
+        assert "exact decisions and constraints" in prompt
+        assert "exact artifact/run identities" in prompt
+        assert "unresolved questions and next actions" in prompt
+        assert "rejected options" in prompt and "reason" in prompt
+
+
 
 
 
