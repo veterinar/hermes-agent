@@ -12790,28 +12790,108 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     if logical_idx >= divergence and isinstance(msg, dict):
                         msg.pop("anthropic_content_blocks", None)
 
+            # Prefix-preservation boundary for the archive_dropped path: the
+            # number of leading logical entries (stored and incoming are
+            # index-aligned) that are byte-identical and therefore stay in
+            # place — their physical rows keep their ids. ``divergence is
+            # None`` means no stored entry differed, so every stored entry is
+            # prefix (strict append or identical transcript).
+            prefix_len = divergence if divergence is not None else len(stored_seq)
+            # Per-logical-index stored row id for the preserved prefix
+            # (carrier entries repeat their host row's id; non-dict incoming
+            # entries carry None but can never be part of a matched prefix).
+            prefix_row_ids_by_index = [
+                entry[0] for entry in stored_seq[:prefix_len]
+            ]
+            preserved_ids: list = []
+            _seen_ids = set()
+            for _rid in prefix_row_ids_by_index:
+                if _rid is not None and _rid not in _seen_ids:
+                    _seen_ids.add(_rid)
+                    preserved_ids.append(_rid)
+
             def _finalize_originals():
                 # Runs ONLY after _execute_write reports a successful commit;
                 # a rolled-back transaction leaves the originals untouched.
                 for original in originals_to_strip:
                     original.pop("anthropic_content_blocks", None)
-                for original, inserted in zip(messages, messages_to_insert):
+                if archive_dropped:
+                    # Preserved prefix dicts receive the PERSISTED row ids.
+                    for logical_idx in range(min(prefix_len, len(messages))):
+                        row_id = prefix_row_ids_by_index[logical_idx]
+                        msg = messages[logical_idx]
+                        if row_id is not None and isinstance(msg, dict):
+                            msg["_row_id"] = row_id
+                    offset = prefix_len
+                else:
+                    offset = 0
+                for original, inserted in zip(
+                    messages[offset:], messages_to_insert[offset:]
+                ):
                     if isinstance(original, dict) and isinstance(inserted, dict):
                         row_id = inserted.get("_row_id")
                         if row_id is not None:
                             original["_row_id"] = row_id
 
             if archive_dropped:
-                conn.execute(
-                    "UPDATE messages SET active = 0 "
-                    "WHERE session_id = ? AND active = 1",
-                    (session_id,),
+                if prefix_len < len(stored_seq):
+                    # Soft-archive only the divergent stored suffix: active
+                    # physical rows from the first divergent stored row on.
+                    # Already-inactive rows are never touched. The NOT-IN
+                    # guard keeps a preserved legacy folded-carrier entry's
+                    # host row alive when it coincides with the boundary.
+                    first_divergent_stored_id = stored_seq[prefix_len][0]
+                    if preserved_ids:
+                        placeholders = ",".join("?" for _ in preserved_ids)
+                        conn.execute(
+                            "UPDATE messages SET active = 0 "
+                            f"WHERE session_id = ? AND active = 1 AND id >= ? "
+                            f"AND id NOT IN ({placeholders})",
+                            [session_id, first_divergent_stored_id, *preserved_ids],
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE messages SET active = 0 "
+                            "WHERE session_id = ? AND active = 1 AND id >= ?",
+                            (session_id, first_divergent_stored_id),
+                        )
+                # else: nothing stored diverged (strict append or identical
+                # transcript) — no active row is archived at all.
+                prefix_tool_calls = 0
+                if preserved_ids:
+                    placeholders = ",".join("?" for _ in preserved_ids)
+                    for row in conn.execute(
+                        f"SELECT tool_calls FROM messages "
+                        f"WHERE session_id = ? AND id IN ({placeholders})",
+                        [session_id, *preserved_ids],
+                    ).fetchall():
+                        raw = row["tool_calls"]
+                        if raw:
+                            try:
+                                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                                prefix_tool_calls += (
+                                    len(parsed) if isinstance(parsed, list) else 0
+                                )
+                            except (TypeError, ValueError):
+                                pass
+                inserted_count, suffix_tool_calls = self._insert_message_rows(
+                    conn, session_id, messages_to_insert[prefix_len:]
                 )
-            else:
                 conn.execute(
-                    f"DELETE FROM messages WHERE session_id = ?{active_clause}",
-                    (session_id,),
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                    "WHERE id = ?",
+                    (
+                        len(preserved_ids) + inserted_count,
+                        prefix_tool_calls + suffix_tool_calls,
+                        session_id,
+                    ),
                 )
+                return _finalize_originals
+
+            conn.execute(
+                f"DELETE FROM messages WHERE session_id = ?{active_clause}",
+                (session_id,),
+            )
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
