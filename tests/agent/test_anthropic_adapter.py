@@ -1183,10 +1183,33 @@ class TestNativeFable51HistoricalClearAtRegressions:
         ]
         assert len(rows) == 2, out
         assert "Turn-one guidance." not in json.dumps(kwargs.get("system", ""))
-        assert out[rows[0][0] - 1]["role"] == "assistant"
-        assert any(
-            isinstance(b, dict) and b.get("type") == "tool_result"
-            for b in out[rows[0][0] + 1]["content"]
+        # The clear_at row intentionally separates tool_use t1 from its
+        # tool_result, so orphan normalization strips that pair — do not
+        # require tool_use/tool_result survival. Assert the normalized
+        # relative ordering instead: the answer-one assistant precedes the
+        # first clear_at row, which precedes the following user turn, which
+        # precedes the second clear_at row.
+        answer_one = next(
+            i for i, m in enumerate(out)
+            if m.get("role") == "assistant" and (
+                m.get("content") == "answer one"
+                or any(
+                    isinstance(b, dict)
+                    and b.get("type") == "text"
+                    and b.get("text") == "answer one"
+                    for b in m.get("content", [])
+                    if isinstance(m.get("content"), list)
+                )
+            )
+        )
+        following_user = next(
+            i for i, m in enumerate(out)
+            if i > rows[0][0] and m.get("role") == "user"
+        )
+        assert answer_one < rows[0][0] < following_user < rows[1][0], out
+        assert rows[0][1]["content"] == "Turn-one guidance."
+        assert all(
+            r[1].get("clear_at") == "next_user_message" for _, r in rows
         )
         assert rows[1][0] == len(out) - 1
         assert rows[1][1]["content"] == "Turn-two guidance."
@@ -1204,9 +1227,11 @@ class TestNativeFable51HistoricalClearAtRegressions:
         ]
         kw_a = build_anthropic_kwargs(
             model="claude-fable-5-1", messages=msgs_a, tools=None, max_tokens=4096,
+            reasoning_config=None,
         )
         kw_b = build_anthropic_kwargs(
             model="claude-fable-5-1", messages=msgs_b, tools=None, max_tokens=4096,
+            reasoning_config=None,
         )
         prefix_len = len(kw_b["messages"])
         assert kw_a["messages"][:prefix_len] == kw_b["messages"]
@@ -1296,7 +1321,7 @@ class TestNativeFable51HistoricalClearAtRegressions:
         )
         assert out[0]["role"] == "user"  # synthetic leading user turn
         assert out[1]["role"] == "assistant"
-        assert out[1]["content"] == "earlier answer"
+        assert out[1]["content"] == [{"type": "text", "text": "earlier answer"}]
         # The clear_at row remains directly after its intended assistant.
         assert out[2] == {"role": "system", "content": "Turn guidance.",
                           "clear_at": "next_user_message"}

@@ -446,16 +446,12 @@ class TestClearAtSystemRows:
             "system",
             "assistant",
         ]
-        # Exact dict bytes for the system rows (minus internal markers).
+        # Semantic fields of the system rows only; replay may add
+        # persistence metadata (timestamp, _row_id) we don't compare.
         for original, replayed in zip(transcript, conv):
             if original["role"] != "system":
                 continue
-            cleaned = {
-                k: v
-                for k, v in replayed.items()
-                if not k.startswith("_")
-            }
-            assert cleaned == original
+            assert {k: replayed[k] for k in original} == original
         # No private carrier key leaks into any display metadata.
         for m in conv:
             meta = m.get("display_metadata") or {}
