@@ -496,12 +496,21 @@ class TestClearAtSystemRows:
             meta = m.get("display_metadata") or {}
             assert "__hermes_clear_at_system__" not in meta
 
-    def test_no_physical_system_row_in_database(self, db):
+    def test_get_messages_returns_physical_system_rows_normalized(self, db):
         _seed_clear_at_pair(db)
         rows = db.get_messages("src")
         assert [r["role"] for r in rows] == [
             "user",
+            "system",
             "assistant",
             "user",
+            "system",
             "assistant",
         ]
+        for row, text in ((rows[1], "system one"), (rows[4], "system two")):
+            assert row["role"] == "system"
+            assert row["content"] == text
+            assert row["clear_at"] == "next_user_message"
+        for r in rows:
+            meta = r.get("display_metadata") or {}
+            assert "__hermes_clear_at_system__" not in meta
