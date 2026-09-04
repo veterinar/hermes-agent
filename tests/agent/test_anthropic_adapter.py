@@ -1209,7 +1209,7 @@ class TestNativeFable51HistoricalClearAtRegressions:
         assert answer_one < rows[0][0] < following_user < rows[1][0], out
         assert rows[0][1]["content"] == "Turn-one guidance."
         assert all(
-            r[1].get("clear_at") == "next_user_message" for _, r in rows
+            r.get("clear_at") == "next_user_message" for _, r in rows
         )
         assert rows[1][0] == len(out) - 1
         assert rows[1][1]["content"] == "Turn-two guidance."
